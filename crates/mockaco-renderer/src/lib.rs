@@ -369,6 +369,7 @@ pub struct DisplayMap {
     config: DisplayConfig,
     folds: FoldSet,
     rows: Vec<DisplayRow>,
+    max_display_width: usize,
     revision: u64,
     last_update: Option<DisplayUpdate>,
 }
@@ -386,6 +387,7 @@ impl DisplayMap {
             snapshot: snapshot.clone(),
             config,
             folds: FoldSet::default(),
+            max_display_width: max_display_width(&rows),
             rows,
             revision: 0,
             last_update: None,
@@ -404,6 +406,7 @@ impl DisplayMap {
             snapshot: snapshot.clone(),
             config,
             folds,
+            max_display_width: max_display_width(&rows),
             rows,
             revision: 0,
             last_update: None,
@@ -430,6 +433,22 @@ impl DisplayMap {
         self.rows.len()
     }
 
+    /// Returns the widest display row in O(1). Layout code uses this cached
+    /// value when updating horizontal scroll bounds; it must not rescan a
+    /// document-sized row vector during a frame or a resize.
+    pub fn max_display_width(&self) -> usize {
+        self.max_display_width
+    }
+
+    /// Returns the stable line-number width without allocating gutter rows.
+    pub fn line_number_width(&self, min_width: usize) -> usize {
+        let max_line = self
+            .rows
+            .last()
+            .map_or(1, |row| row.buffer_line.saturating_add(1));
+        min_width.max(max_line.to_string().len())
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -447,19 +466,36 @@ impl DisplayMap {
             0,
             self.snapshot.position_map().line_count(),
         );
+        self.max_display_width = max_display_width(&self.rows);
         self.revision = self.revision.saturating_add(1);
         self.last_update = None;
     }
 
     pub fn set_foldable_regions(&mut self, foldable: impl IntoIterator<Item = FoldRegion>) {
         self.folds = FoldSet::with_foldable(self.folds.regions().to_vec(), foldable);
-        self.rows = build_rows(
-            &self.snapshot,
-            &self.config,
-            &self.folds,
-            0,
-            self.snapshot.position_map().line_count(),
-        );
+        self.revision = self.revision.saturating_add(1);
+        self.last_update = None;
+    }
+
+    /// Replaces foldability only for a line window. Foldability changes do not
+    /// alter display rows unless an active fold is changed, so this avoids
+    /// rebuilding the document-sized layout when a background parser reports
+    /// syntax for the current viewport.
+    pub fn set_foldable_regions_in_line_range(
+        &mut self,
+        line_range: Range<usize>,
+        foldable: impl IntoIterator<Item = FoldRegion>,
+    ) {
+        let preserved = self
+            .folds
+            .foldable_regions()
+            .iter()
+            .filter(|region| {
+                region.end_line <= line_range.start || region.start_line >= line_range.end
+            })
+            .cloned();
+        self.folds =
+            FoldSet::with_foldable(self.folds.regions().to_vec(), preserved.chain(foldable));
         self.revision = self.revision.saturating_add(1);
         self.last_update = None;
     }
@@ -533,6 +569,7 @@ impl DisplayMap {
                 0,
                 snapshot.position_map().line_count(),
             );
+            self.max_display_width = max_display_width(&self.rows);
             self.revision = self.revision.saturating_add(1);
             let update = DisplayUpdate {
                 old_range,
@@ -576,6 +613,7 @@ impl DisplayMap {
         self.rows = prefix;
         self.rows.extend(replacement);
         self.rows.extend(suffix);
+        self.max_display_width = max_display_width(&self.rows);
         self.snapshot = snapshot.clone();
         self.revision = self.revision.saturating_add(1);
         let update = DisplayUpdate {
@@ -659,17 +697,25 @@ impl DisplayMap {
     }
 
     pub fn gutter(&self, min_width: usize) -> GutterLayout {
-        let max_line = self
-            .rows
-            .iter()
-            .map(|row| row.buffer_line + 1)
-            .max()
-            .unwrap_or(1);
-        let line_number_width = min_width.max(max_line.to_string().len());
+        self.gutter_for_display_range(min_width, 0..self.rows.len())
+    }
+
+    /// Builds only the gutter rows needed by a paint viewport. The line
+    /// number width is derived from the final logical row and does not require
+    /// walking the document-sized display map.
+    pub fn gutter_for_display_range(
+        &self,
+        min_width: usize,
+        display_range: Range<usize>,
+    ) -> GutterLayout {
+        let line_number_width = self.line_number_width(min_width);
         let rows = self
             .rows
+            .get(display_range.start.min(self.rows.len())..display_range.end.min(self.rows.len()))
+            .unwrap_or_default()
             .iter()
             .enumerate()
+            .map(|(offset, row)| (display_range.start.min(self.rows.len()) + offset, row))
             .map(|(display_row, row)| GutterRow {
                 display_row,
                 buffer_line: row.buffer_line,
@@ -686,8 +732,21 @@ impl DisplayMap {
     }
 
     pub fn project_decorations(&self, decorations: &[Decoration]) -> Vec<ProjectedDecoration> {
+        self.project_decorations_in_display_range(decorations, 0..self.rows.len())
+    }
+
+    /// Projects decorations only across the requested display rows. Painting
+    /// must never rescan every row of a large document for a small viewport.
+    pub fn project_decorations_in_display_range(
+        &self,
+        decorations: &[Decoration],
+        display_range: Range<usize>,
+    ) -> Vec<ProjectedDecoration> {
         let mut projected = Vec::new();
-        for (display_row, row) in self.rows.iter().enumerate() {
+        let start = display_range.start.min(self.rows.len());
+        let end = display_range.end.min(self.rows.len());
+        for (offset, row) in self.rows[start..end].iter().enumerate() {
+            let display_row = start + offset;
             for decoration in decorations {
                 let start = decoration.range.start.max(row.start_byte);
                 let end = decoration.range.end.min(row.end_byte);
@@ -719,6 +778,10 @@ impl DisplayMap {
         }
         projected
     }
+}
+
+fn max_display_width(rows: &[DisplayRow]) -> usize {
+    rows.iter().map(|row| row.display_width).max().unwrap_or(0)
 }
 
 fn remap_row(
@@ -1055,6 +1118,30 @@ mod tests {
         assert_eq!(projected[0].start_column..projected[0].end_column, 1..3);
         assert_eq!(projected[1].display_row, 1);
         assert_eq!(projected[1].start_column..projected[1].end_column, 0..2);
+    }
+
+    #[test]
+    fn ranged_paint_helpers_do_not_materialize_the_document_gutter() {
+        let document = Document::new(
+            (0..100)
+                .map(|line| format!("line {line}\n"))
+                .collect::<String>(),
+        );
+        let map = DisplayMap::new(&document.snapshot(), DisplayConfig::unwrapped());
+
+        let gutter = map.gutter_for_display_range(4, 40..45);
+        assert_eq!(gutter.rows.len(), 5);
+        assert_eq!(gutter.rows.first().unwrap().display_row, 40);
+        assert_eq!(gutter.rows.first().unwrap().line_number, 41);
+
+        let projected = map.project_decorations_in_display_range(
+            &[Decoration::new(0..document.len_bytes(), 7)],
+            40..45,
+        );
+        assert_eq!(projected.len(), 5);
+        assert!(projected
+            .iter()
+            .all(|decoration| (40..45).contains(&decoration.display_row)));
     }
 
     #[test]

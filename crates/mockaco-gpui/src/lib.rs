@@ -516,6 +516,7 @@ pub struct EditorSurface {
     display: DisplayMap,
     highlighter: RustTreeSitterProvider,
     highlights: IncrementalHighlights,
+    language_coverage: Option<(u64, Range<usize>)>,
     scroll: ScrollState,
     geometry: SurfaceGeometry,
     theme: SurfaceTheme,
@@ -532,22 +533,14 @@ impl EditorSurface {
         let editor = EditorState::new(text);
         let snapshot = editor.snapshot();
         let highlighter = RustTreeSitterProvider::new().expect("Rust Tree-sitter provider loads");
-        let highlights = highlighter
-            .highlight(&snapshot, 0..snapshot.len_bytes())
-            .map(IncrementalHighlights::from_result)
-            .unwrap_or_default();
-        let mut display = DisplayMap::new(&snapshot, display_config);
-        if let Ok(folds) = highlighter.fold_ranges(&snapshot, 0..snapshot.len_bytes()) {
-            display.set_foldable_regions(folds.into_iter().map(|fold| {
-                mockaco_renderer::FoldRegion::new(fold.start_line, fold.end_line)
-                    .placeholder(fold.placeholder)
-            }));
-        }
+        let highlights = IncrementalHighlights::new();
+        let display = DisplayMap::new(&snapshot, display_config);
         let mut surface = Self {
             editor,
             display,
             highlighter,
             highlights,
+            language_coverage: None,
             scroll: ScrollState::default(),
             geometry,
             theme: SurfaceTheme::default(),
@@ -555,6 +548,7 @@ impl EditorSurface {
             invalidation: InvalidationState::default(),
         };
         surface.recompute_scroll_viewport();
+        surface.ensure_language_state_for_viewport();
         surface
     }
 
@@ -594,6 +588,7 @@ impl EditorSurface {
     pub fn set_geometry(&mut self, geometry: SurfaceGeometry) {
         self.geometry = geometry;
         self.recompute_scroll_viewport();
+        self.ensure_language_state_for_viewport();
         self.invalidation.push(InvalidationKind::Geometry, None);
     }
 
@@ -681,8 +676,7 @@ impl EditorSurface {
     }
 
     pub fn gutter_width(&self) -> f32 {
-        (self.display.gutter(4).line_number_width as f32 + 3.0)
-            * self.geometry.gutter_character_width
+        (self.display.line_number_width(4) as f32 + 3.0) * self.geometry.gutter_character_width
     }
 
     pub fn select_word_at(&mut self, byte: usize) -> bool {
@@ -781,12 +775,14 @@ impl EditorSurface {
 
     pub fn set_viewport(&mut self, rows: usize, columns: usize) {
         self.scroll.set_viewport(rows, columns);
+        self.ensure_language_state_for_viewport();
         self.invalidation.push(InvalidationKind::Viewport, None);
     }
 
     pub fn scroll_by(&mut self, vertical: isize, horizontal: isize) -> bool {
         let changed = self.scroll.scroll_by(vertical, horizontal);
         if changed {
+            self.ensure_language_state_for_viewport();
             self.invalidation.push(InvalidationKind::Scroll, None);
         }
         changed
@@ -795,6 +791,7 @@ impl EditorSurface {
     pub fn scroll_to(&mut self, row: usize, column: usize) -> bool {
         let changed = self.scroll.scroll_to(row, column);
         if changed {
+            self.ensure_language_state_for_viewport();
             self.invalidation.push(InvalidationKind::Scroll, None);
         }
         changed
@@ -819,21 +816,20 @@ impl EditorSurface {
         let mut display = self.display.clone();
         let update = display.update(&snapshot, &applied)?;
         self.display = display;
+        let _ = self
+            .highlights
+            .apply_transaction(&before_snapshot, &applied);
+        self.language_coverage = None;
         if let Ok(result) = self.highlighter.apply_transaction(
             &before_snapshot,
             &snapshot,
             &applied,
-            0..snapshot.len_bytes(),
+            update.new_range.clone(),
         ) {
-            let _ = self.highlights.accept(result);
-        } else if let Ok(result) = self
-            .highlighter
-            .highlight(&snapshot, 0..snapshot.len_bytes())
-        {
-            let _ = self.highlights.accept(result);
+            let _ = self.highlights.accept_range(result);
         }
-        self.refresh_language_state(&snapshot);
         self.recompute_scroll_viewport();
+        self.ensure_language_state_for_viewport();
         self.invalidation
             .push(InvalidationKind::Document, Some(update.new_range));
         Ok(applied)
@@ -891,7 +887,6 @@ impl EditorSurface {
     /// translation can reveal content continuously while the editor viewport
     /// clips the out-of-bounds rows.
     pub fn render_frame_with_buffer(&self, buffer_rows: usize) -> RenderFrame {
-        let viewport_range = self.scroll.visible_rows();
         let display_row_count = self.display.row_count();
         let render_start = self
             .scroll
@@ -907,6 +902,14 @@ impl EditorSurface {
             .min(display_row_count);
         let render_range = render_start..render_end;
         let viewport = DisplayViewport::new(self.scroll.top_row, self.scroll.viewport_rows);
+        let snapshot = self.display.snapshot();
+        let text = snapshot.text();
+        let position_map = snapshot.position_map();
+        let active_buffer_line = self
+            .editor
+            .selections()
+            .primary()
+            .and_then(|selection| position_map.byte_to_line(selection.cursor()).ok());
         let rows = render_range
             .clone()
             .map(|display_row| {
@@ -915,41 +918,27 @@ impl EditorSurface {
                     display_row,
                     buffer_line: row.buffer_line,
                     source_range: row.start_byte..row.end_byte,
-                    text: self.display.snapshot().text()[row.start_byte..row.end_byte].to_owned(),
-                    y: (display_row as isize - self.scroll.top_row as isize) as f32
-                        * self.geometry.line_height,
+                    text: text[row.start_byte..row.end_byte].to_owned(),
+                    y: display_y(display_row, self.scroll.top_row, self.geometry.line_height),
                     height: self.geometry.line_height,
                     continuation: row.continuation,
                     folded: row.folded,
                     truncated: row.truncated,
-                    active: self.editor.selections().primary().and_then(|selection| {
-                        self.display
-                            .snapshot()
-                            .position_map()
-                            .byte_to_line(selection.cursor())
-                            .ok()
-                    }) == Some(row.buffer_line),
+                    active: active_buffer_line == Some(row.buffer_line),
                     indent_guides: indent_guides_for_line(
-                        self.display.snapshot().text(),
-                        self.display
-                            .snapshot()
-                            .position_map()
+                        text,
+                        position_map
                             .line_start(row.buffer_line)
                             .unwrap_or(row.start_byte),
-                        self.display
-                            .snapshot()
-                            .position_map()
+                        position_map
                             .line_end(row.buffer_line)
                             .unwrap_or(row.end_byte),
                         self.display.config().tab_width,
                     ),
                     tokens: self
                         .highlights
-                        .tokens()
+                        .tokens_in_range(row.start_byte..row.end_byte)
                         .iter()
-                        .filter(|token| {
-                            token.range.start < row.end_byte && token.range.end > row.start_byte
-                        })
                         .map(|token| PaintToken {
                             range: token.range.clone(),
                             kind: token.kind.clone(),
@@ -959,15 +948,14 @@ impl EditorSurface {
                 }
             })
             .collect::<Vec<_>>();
-        let gutter = self.display.gutter(4);
-        let selections = self.selection_geometry(&viewport_range);
-        let carets = self.caret_geometry(&viewport_range);
+        let gutter = self
+            .display
+            .gutter_for_display_range(4, render_range.clone());
+        let selections = self.selection_geometry(&render_range);
+        let carets = self.caret_geometry(&render_range);
         let decorations: Vec<ProjectedDecoration> = self
             .display
-            .project_decorations(&self.decorations)
-            .into_iter()
-            .filter(|decoration| viewport_range.contains(&decoration.display_row))
-            .collect();
+            .project_decorations_in_display_range(&self.decorations, render_range.clone());
         let decoration_geometry = decorations
             .iter()
             .map(|decoration| DecorationGeometry {
@@ -977,8 +965,11 @@ impl EditorSurface {
                     .end_column
                     .saturating_sub(decoration.start_column) as f32
                     * self.geometry.character_width,
-                y: (decoration.display_row - self.scroll.top_row) as f32
-                    * self.geometry.line_height,
+                y: display_y(
+                    decoration.display_row,
+                    self.scroll.top_row,
+                    self.geometry.line_height,
+                ),
                 height: self.geometry.line_height,
                 style: decoration.style,
             })
@@ -1006,12 +997,11 @@ impl EditorSurface {
             .filter(|(_, selection)| !selection.is_caret())
             .flat_map(|(index, selection)| {
                 self.display
-                    .project_decorations(&[Decoration::new(
-                        selection.ordered_range(),
-                        index as u32,
-                    )])
+                    .project_decorations_in_display_range(
+                        &[Decoration::new(selection.ordered_range(), index as u32)],
+                        visible.clone(),
+                    )
                     .into_iter()
-                    .filter(|projection| visible.contains(&projection.display_row))
                     .map(move |projection| SelectionGeometry {
                         display_row: projection.display_row,
                         start_column: projection.start_column,
@@ -1022,8 +1012,11 @@ impl EditorSurface {
                             .saturating_sub(projection.start_column)
                             as f32
                             * self.geometry.character_width,
-                        y: (projection.display_row - self.scroll.top_row) as f32
-                            * self.geometry.line_height,
+                        y: display_y(
+                            projection.display_row,
+                            self.scroll.top_row,
+                            self.geometry.line_height,
+                        ),
                         height: self.geometry.line_height,
                         primary: index + 1 == selections.len(),
                         source_range: projection.source_range,
@@ -1064,7 +1057,7 @@ impl EditorSurface {
                     display_row: point.row,
                     column: point.column,
                     x: point.column as f32 * self.geometry.character_width,
-                    y: (point.row - self.scroll.top_row) as f32 * self.geometry.line_height,
+                    y: display_y(point.row, self.scroll.top_row, self.geometry.line_height),
                     height: self.geometry.line_height,
                     primary: index + 1 == selections.len(),
                 })
@@ -1076,16 +1069,12 @@ impl EditorSurface {
         let rows = (self.geometry.height / self.geometry.line_height.max(1.0)).floor() as usize;
         let columns =
             (self.geometry.width / self.geometry.character_width.max(1.0)).floor() as usize;
-        let max_width = self
-            .display
-            .rows()
-            .iter()
-            .map(|row| row.display_width)
-            .max()
-            .unwrap_or(0);
         self.scroll.set_viewport(rows, columns);
-        self.scroll
-            .set_content_with_bottom_padding(self.display.row_count(), max_width, 1);
+        self.scroll.set_content_with_bottom_padding(
+            self.display.row_count(),
+            self.display.max_display_width(),
+            1,
+        );
     }
 
     fn rebuild_display_after_history_change(&mut self) {
@@ -1099,22 +1088,60 @@ impl EditorSurface {
     }
 
     fn refresh_language_state(&mut self, snapshot: &DocumentSnapshot) {
+        self.highlights = IncrementalHighlights::new();
+        self.language_coverage = None;
+        self.display.set_foldable_regions([]);
+        debug_assert_eq!(snapshot.version(), self.display.snapshot().version());
+        self.ensure_language_state_for_viewport();
+    }
+
+    fn ensure_language_state_for_viewport(&mut self) {
+        let document_version = self.display.snapshot().version();
+        let rows = self.display.rows();
+        let start_row = self.scroll.top_row.min(rows.len());
+        let end_row = start_row
+            .saturating_add(self.scroll.viewport_rows.saturating_add(1))
+            .min(rows.len());
+        let Some(first) = rows.get(start_row) else {
+            return;
+        };
+        let last = rows
+            .get(end_row.saturating_sub(1).max(start_row))
+            .unwrap_or(first);
+        let requested = first.start_byte..last.end_byte;
+        if self
+            .language_coverage
+            .as_ref()
+            .is_some_and(|(version, covered)| {
+                *version == document_version
+                    && covered.start <= requested.start
+                    && covered.end >= requested.end
+            })
+        {
+            return;
+        }
+
         if let Ok(result) = self
             .highlighter
-            .highlight(snapshot, 0..snapshot.len_bytes())
+            .highlight(self.display.snapshot(), requested.clone())
         {
-            let _ = self.highlights.accept(result);
+            let _ = self.highlights.accept_range(result);
         }
+        let line_start = first.buffer_line;
+        let line_end = last.buffer_line.saturating_add(1);
         if let Ok(folds) = self
             .highlighter
-            .fold_ranges(snapshot, 0..snapshot.len_bytes())
+            .fold_ranges(self.display.snapshot(), requested.clone())
         {
-            self.display
-                .set_foldable_regions(folds.into_iter().map(|fold| {
+            self.display.set_foldable_regions_in_line_range(
+                line_start..line_end,
+                folds.into_iter().map(|fold| {
                     mockaco_renderer::FoldRegion::new(fold.start_line, fold.end_line)
                         .placeholder(fold.placeholder)
-                }));
+                }),
+            );
         }
+        self.language_coverage = Some((document_version, requested));
     }
 }
 
@@ -1288,6 +1315,10 @@ fn merge_ranges(left: Option<Range<usize>>, right: Option<Range<usize>>) -> Opti
         (Some(range), None) | (None, Some(range)) => Some(range),
         (None, None) => None,
     }
+}
+
+fn display_y(display_row: usize, top_row: usize, line_height: f32) -> f32 {
+    (display_row as f32 - top_row as f32) * line_height
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2897,6 +2928,27 @@ mod tests {
         assert!(frame.rows.iter().any(|row| row.active));
         assert!(frame.theme.primary_selection != frame.theme.background);
         assert!(frame.gutter.rows.iter().any(|row| row.foldable));
+    }
+
+    #[test]
+    fn large_documents_keep_paint_data_and_highlight_cache_viewport_bounded() {
+        let text = (0..40_000)
+            .map(|line| format!("fn item_{line}() {{ let value = {line}; }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut surface =
+            EditorSurface::new(text, DisplayConfig::unwrapped(), SurfaceGeometry::default());
+        surface.set_viewport(20, 120);
+        surface.scroll_to(39_990, 0);
+
+        let frame = surface.render_frame_with_buffer(1);
+        assert!(frame.rows.len() <= 22);
+        assert_eq!(frame.rows.len(), frame.gutter.rows.len());
+        assert!(surface.highlights.tokens().len() < 1_000);
+        assert!(frame.decorations.iter().all(|decoration| frame
+            .rows
+            .iter()
+            .any(|row| row.display_row == decoration.display_row)));
     }
 
     #[test]

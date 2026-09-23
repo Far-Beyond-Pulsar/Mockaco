@@ -594,6 +594,9 @@ fn point_at(text: &str, byte: usize) -> Point {
 fn collect_folds(node: tree_sitter::Node<'_>, range: &Range<usize>, folds: &mut Vec<FoldRange>) {
     let start = node.start_byte();
     let end = node.end_byte();
+    if end <= range.start || start >= range.end {
+        return;
+    }
     let kind = node.kind();
     let foldable = kind.ends_with("_block")
         || matches!(
@@ -718,6 +721,19 @@ impl IncrementalHighlights {
         &self.tokens
     }
 
+    /// Returns the sorted token slice intersecting a byte range without
+    /// scanning tokens outside that range. Highlight tokens are kept ordered
+    /// by start byte when results are accepted.
+    pub fn tokens_in_range(&self, range: Range<usize>) -> &[SyntaxToken] {
+        let start = self
+            .tokens
+            .partition_point(|token| token.range.end <= range.start);
+        let end = self
+            .tokens
+            .partition_point(|token| token.range.start < range.end);
+        &self.tokens[start.min(end)..end]
+    }
+
     pub fn accept(&mut self, result: HighlightResult) -> Result<(), LanguageError> {
         if let Some(version) = self.version {
             if result.version < version {
@@ -729,6 +745,28 @@ impl IncrementalHighlights {
         }
         self.version = Some(result.version);
         self.tokens = result.tokens;
+        Ok(())
+    }
+
+    /// Accepts a range result while retaining already-highlighted ranges
+    /// outside it. The editor maps those retained tokens through the core
+    /// transaction before asking the parser for the changed/visible window.
+    pub fn accept_range(&mut self, result: HighlightResult) -> Result<(), LanguageError> {
+        if let Some(version) = self.version {
+            if result.version < version {
+                return Err(LanguageError::StaleVersion {
+                    expected: version,
+                    actual: result.version,
+                });
+            }
+        }
+        self.tokens.retain(|token| {
+            token.range.end <= result.range.start || token.range.start >= result.range.end
+        });
+        self.tokens.extend(result.tokens);
+        self.tokens
+            .sort_by_key(|token| (token.range.start, token.range.end));
+        self.version = Some(result.version);
         Ok(())
     }
 
