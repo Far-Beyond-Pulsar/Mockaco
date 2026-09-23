@@ -5,23 +5,12 @@ use crate::{
 use std::fmt;
 use std::ops::Range;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ViewportIntent {
     pub top_line: usize,
     pub left_column: usize,
     pub visible_lines: usize,
     pub visible_columns: usize,
-}
-
-impl Default for ViewportIntent {
-    fn default() -> Self {
-        Self {
-            top_line: 0,
-            left_column: 0,
-            visible_lines: 0,
-            visible_columns: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
