@@ -73,9 +73,19 @@ The framework-independent editing engine.
 - `UndoHistory`: grouped, branching-safe undo/redo.
 - `DocumentSnapshot`: cheap read-only view used by background workers.
 - `EditorState`: selections, viewport intent, mode, and pending composition.
+- `DocumentSession`: host-neutral load, dirty, save, external-change, and
+  close lifecycle for one editor document.
 
 The core should not import GPUI, Tree-sitter, LSP types, filesystem APIs, or
 Pulsar types.
+
+`DocumentSession` is deliberately a lifecycle contract, not a filesystem
+backend. A host supplies decoded content, logical locations, save results, and
+close/external-change decisions. The session returns typed requests and
+receipts, tracks content identity and generation, and preserves local content
+when a save fails or an external change conflicts with dirty edits. Successful
+saves produce a framework-independent `SaveEvent`; LSP or other integrations
+may translate that event at their own boundary.
 
 ### `mockaco-language`
 
@@ -170,13 +180,19 @@ ViewState           scroll, viewport, wrapping, folding
 SelectionState      carets, selections, rectangular mode
 DecorationState     syntax, diagnostics, search, diff, semantic tokens
 InteractionState    focus, IME, mouse drag, completion/hover overlays
-IntegrationState    LSP requests, filesystem state, save state
+IntegrationState    LSP requests, host lifecycle state, save state
 ```
 
 Document mutations produce a transaction and document version. Derived state
 is updated from the transaction rather than recomputed from the entire file.
 Rendering consumes a coherent snapshot and never performs filesystem, parser,
 or LSP work synchronously.
+
+For document lifecycle, `DocumentSession` owns the saved content identity and
+generation. Host I/O is asynchronous and enters through typed load/save and
+external-change methods. A host must not treat a requested save as successful
+until it returns a success receipt, and it must route a save event to optional
+integrations only after that receipt.
 
 ## Rendering pipeline
 

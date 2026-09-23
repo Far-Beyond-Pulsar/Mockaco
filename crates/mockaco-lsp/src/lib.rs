@@ -13,8 +13,8 @@ use lsp_types::{
 };
 use mockaco_core::{
     Diagnostic as CoreDiagnostic, DiagnosticError, DiagnosticSet, DiagnosticSeverity,
-    DocumentSnapshot, Edit, EditorState, Grouping, PositionError, TextPosition, Transaction,
-    TransactionError,
+    DocumentSnapshot, Edit, EditorState, Grouping, PositionError, SaveEvent, TextPosition,
+    Transaction, TransactionError,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -251,6 +251,20 @@ impl DocumentSync {
             .get(uri)
             .map(|document| document.language_id.as_str())
     }
+}
+
+/// Sends the LSP save notification represented by a successfully completed
+/// host save. The core lifecycle remains unaware of LSP and only exposes the
+/// exact saved text through [`SaveEvent`].
+pub fn send_save_event<T: LspTransport>(
+    transport: &mut T,
+    uri: &Uri,
+    event: &SaveEvent,
+) -> Result<(), TransportError> {
+    transport.send_notification(OutboundNotification::DidSave {
+        uri: uri.clone(),
+        text: Some(event.text.clone()),
+    })
 }
 
 fn lsp_version(version: DocumentVersion) -> Result<i32, SyncError> {
@@ -1000,6 +1014,37 @@ mod tests {
         assert!(matches!(
             sync.change_full(&mut transport, &document_uri, 2, ""),
             Err(SyncError::NotOpen(_))
+        ));
+    }
+
+    #[test]
+    fn core_save_receipt_emits_did_save_notification() {
+        let mut session = mockaco_core::DocumentSession::new(
+            Some(mockaco_core::DocumentLocation::new("doc://main")),
+            "x",
+            mockaco_core::DocumentMetadata::detect_utf8("x"),
+        )
+        .unwrap();
+        session.apply_edit(0..1, "saved").unwrap();
+        let request = session.request_save().unwrap();
+        let receipt = match session.complete_save(
+            request.id,
+            mockaco_core::HostSaveResult::Success {
+                location: mockaco_core::DocumentLocation::new("doc://main"),
+            },
+        ) {
+            mockaco_core::SaveCompletion::Saved(receipt) => receipt,
+            completion => panic!("expected saved receipt, got {completion:?}"),
+        };
+
+        let mut transport = RecordingTransport::default();
+        let document_uri = uri("file:///main.txt");
+        send_save_event(&mut transport, &document_uri, &receipt.event()).unwrap();
+
+        assert!(matches!(
+            transport.notifications.as_slice(),
+            [OutboundNotification::DidSave { uri, text: Some(text) }]
+                if uri == &document_uri && text == "saved"
         ));
     }
 

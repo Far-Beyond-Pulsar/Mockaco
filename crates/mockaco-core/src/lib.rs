@@ -7,6 +7,7 @@
 mod diagnostics;
 mod document;
 mod editor_state;
+mod lifecycle;
 mod position_map;
 mod search;
 mod selection;
@@ -16,6 +17,12 @@ mod undo;
 pub use diagnostics::{Diagnostic, DiagnosticError, DiagnosticSet, DiagnosticSeverity};
 pub use document::{Document, DocumentError, DocumentSnapshot};
 pub use editor_state::{EditorState, ImeComposition, ImeError, ViewportIntent};
+pub use lifecycle::{
+    CloseDecision, CloseOutcome, ContentIdentity, DocumentLocation, DocumentMetadata,
+    DocumentSession, EncodingMetadata, ExternalChange, ExternalChangeDecision, ExternalChangeError,
+    ExternalChangeOutcome, HostSaveError, HostSaveResult, LoadError, LoadReceipt, NewlineStyle,
+    SaveCompletion, SaveEvent, SaveKind, SaveReceipt, SaveRequest, SaveRequestError, SaveRequestId,
+};
 pub use position_map::{
     ByteOffset, ColumnEncoding, LineColumn, Position, PositionError, PositionMap, TextPosition,
     Utf16Offset,
