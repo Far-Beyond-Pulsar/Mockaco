@@ -2109,18 +2109,18 @@ pub mod native {
                     // between line boundaries instead of snapping immediately.
                     let (vertical, remainder) = fractional_line_scroll(
                         self.scroll_remainder,
-                        point.y,
+                        -point.y,
                         geometry.line_height,
                     );
                     self.scroll_remainder = remainder;
                     (vertical, point.x.round() as isize)
                 }
                 ScrollDelta::Pixels(point) => {
-                    let total = self.scroll_remainder + point.y.as_f32();
+                    let total = self.scroll_remainder - point.y.as_f32();
                     let vertical = (total / geometry.line_height.max(1.0)).trunc() as isize;
                     self.scroll_remainder = total - vertical as f32 * geometry.line_height.max(1.0);
                     (
-                        vertical,
+                        -vertical,
                         (point.x.as_f32() / geometry.character_width.max(1.0)).round() as isize,
                     )
                 }
@@ -2150,6 +2150,35 @@ pub mod native {
         let total = remainder + lines * line_height * 0.45;
         let vertical = (total / line_height).trunc() as isize;
         (vertical, total - vertical as f32 * line_height)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct ScrollbarGeometry {
+        thumb_top: f32,
+        thumb_height: f32,
+    }
+
+    fn scrollbar_geometry(
+        scroll: super::ScrollState,
+        track_height: f32,
+    ) -> Option<ScrollbarGeometry> {
+        if scroll.content_rows <= scroll.viewport_rows || track_height <= 0.0 {
+            return None;
+        }
+        let track_height = track_height.max(1.0);
+        let ratio = scroll.viewport_rows as f32 / scroll.content_rows as f32;
+        let thumb_height = (track_height * ratio).clamp(28.0, track_height);
+        let travel = (track_height - thumb_height).max(0.0);
+        let max_top = scroll.content_rows.saturating_sub(scroll.viewport_rows);
+        let thumb_top = if max_top == 0 {
+            0.0
+        } else {
+            travel * scroll.top_row.min(max_top) as f32 / max_top as f32
+        };
+        Some(ScrollbarGeometry {
+            thumb_top,
+            thumb_height,
+        })
     }
 
     impl Render for WgpuiEditorView {
@@ -2430,7 +2459,30 @@ pub mod native {
                 .flex_1()
                 .h(px(geometry.height))
                 .overflow_hidden()
+                .relative()
                 .child(row_stack);
+            let mut rows = rows;
+            if let Some(scrollbar) = scrollbar_geometry(self.surface.scroll(), geometry.height) {
+                rows = rows.child(
+                    div()
+                        .absolute()
+                        .top(px(0.0))
+                        .right(px(4.0))
+                        .w(px(8.0))
+                        .h(px(geometry.height))
+                        .bg(color(SurfaceColor::rgba(13, 20, 32, 80)))
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px(scrollbar.thumb_top))
+                                .right(px(0.0))
+                                .w(px(8.0))
+                                .h(px(scrollbar.thumb_height))
+                                .rounded_sm()
+                                .bg(color(SurfaceColor::rgba(122, 151, 187, 190))),
+                        ),
+                );
+            }
             root.child(rows)
         }
     }
@@ -2505,13 +2557,28 @@ pub mod native {
 
         #[test]
         fn line_wheel_scroll_keeps_a_fractional_visual_remainder() {
-            let (rows, remainder) = fractional_line_scroll(0.0, 1.0, 20.0);
+            let (rows, remainder) = fractional_line_scroll(0.0, -1.0, 20.0);
             assert_eq!(rows, 0);
-            assert!((remainder - 9.0).abs() < f32::EPSILON);
+            assert!((remainder + 9.0).abs() < f32::EPSILON);
 
-            let (rows, remainder) = fractional_line_scroll(remainder, 1.0, 20.0);
+            let (rows, remainder) = fractional_line_scroll(remainder, -1.0, 20.0);
             assert_eq!(rows, 0);
-            assert!((remainder - 18.0).abs() < f32::EPSILON);
+            assert!((remainder + 18.0).abs() < f32::EPSILON);
+        }
+
+        #[test]
+        fn scrollbar_thumb_tracks_logical_scroll_and_has_a_minimum_size() {
+            let mut scroll = ScrollState::default();
+            scroll.set_viewport(10, 80);
+            scroll.set_content_with_bottom_padding(100, 80, 1);
+            let top = scrollbar_geometry(scroll, 400.0).expect("scrollbar is visible");
+            scroll.scroll_to(usize::MAX, 0);
+            let bottom = scrollbar_geometry(scroll, 400.0).expect("scrollbar is visible");
+
+            assert!(top.thumb_height >= 28.0);
+            assert!(bottom.thumb_top > top.thumb_top);
+            assert!(bottom.thumb_top + bottom.thumb_height <= 400.0);
+            assert!(scrollbar_geometry(scroll, 0.0).is_none());
         }
     }
 }
