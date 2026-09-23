@@ -5,4 +5,5 @@ members = [
     "crates/mockaco-language",
     "crates/mockaco-renderer",
     "crates/mockaco-gpui",
+    "crates/mockaco-lsp",
 ]

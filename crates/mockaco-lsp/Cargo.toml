@@ -1,0 +1,13 @@
+[package]
+name = "mockaco-lsp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Framework-independent versioned LSP integration for Mockaco"
+
+[dependencies]
+lsp-types = { version = "0.97.0", features = ["proposed"] }
+mockaco-core = { path = "../mockaco-core" }
+
+[lib]
+path = "src/lib.rs"
