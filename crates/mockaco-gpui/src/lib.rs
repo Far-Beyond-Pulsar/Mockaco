@@ -62,7 +62,19 @@ impl ScrollState {
     }
 
     pub fn set_content(&mut self, rows: usize, columns: usize) {
-        self.content_rows = rows;
+        self.set_content_with_bottom_padding(rows, columns, 0);
+    }
+
+    /// Sets the scrollable content size while reserving presentation-only
+    /// rows after the real content. The padding participates in scroll bounds
+    /// but is never a document/display row.
+    pub fn set_content_with_bottom_padding(
+        &mut self,
+        rows: usize,
+        columns: usize,
+        bottom_padding_rows: usize,
+    ) {
+        self.content_rows = rows.saturating_add(bottom_padding_rows);
         self.content_columns = columns;
         self.clamp();
     }
@@ -880,13 +892,19 @@ impl EditorSurface {
     /// clips the out-of-bounds rows.
     pub fn render_frame_with_buffer(&self, buffer_rows: usize) -> RenderFrame {
         let viewport_range = self.scroll.visible_rows();
-        let render_start = self.scroll.top_row.saturating_sub(buffer_rows);
+        let display_row_count = self.display.row_count();
+        let render_start = self
+            .scroll
+            .top_row
+            .saturating_sub(buffer_rows)
+            .min(display_row_count);
         let render_end = self
             .scroll
             .top_row
             .saturating_add(self.scroll.viewport_rows)
             .saturating_add(buffer_rows)
-            .min(self.scroll.content_rows);
+            .min(self.scroll.content_rows)
+            .min(display_row_count);
         let render_range = render_start..render_end;
         let viewport = DisplayViewport::new(self.scroll.top_row, self.scroll.viewport_rows);
         let rows = render_range
@@ -1066,7 +1084,8 @@ impl EditorSurface {
             .max()
             .unwrap_or(0);
         self.scroll.set_viewport(rows, columns);
-        self.scroll.set_content(self.display.row_count(), max_width);
+        self.scroll
+            .set_content_with_bottom_padding(self.display.row_count(), max_width, 1);
     }
 
     fn rebuild_display_after_history_change(&mut self) {
@@ -2548,6 +2567,25 @@ mod tests {
         assert_eq!(frame.rows[1].y, 0.0);
         assert_eq!(frame.rows[3].y, 40.0);
         assert_eq!(frame.viewport.top_row, 1);
+    }
+
+    #[test]
+    fn bottom_scroll_padding_allows_the_last_line_to_clear_the_edge() {
+        let mut surface = surface("a\nb\nc\nd");
+        surface.set_viewport(2, 20);
+        assert_eq!(
+            surface.scroll().content_rows,
+            surface.display().row_count() + 1
+        );
+        surface.scroll_to(usize::MAX, 0);
+        let frame = surface.render_frame_with_buffer(1);
+
+        assert_eq!(frame.viewport.top_row, 3);
+        assert_eq!(frame.rows.last().map(|row| row.display_row), Some(3));
+        assert!(frame
+            .rows
+            .iter()
+            .all(|row| row.display_row < surface.display().row_count()));
     }
 
     #[test]
