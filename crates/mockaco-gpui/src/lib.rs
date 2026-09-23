@@ -255,6 +255,7 @@ pub struct PaintRow {
     pub folded: bool,
     pub truncated: bool,
     pub active: bool,
+    pub indent_guides: Vec<usize>,
     pub tokens: Vec<PaintToken>,
 }
 
@@ -853,6 +854,20 @@ impl EditorSurface {
                             .byte_to_line(selection.cursor())
                             .ok()
                     }) == Some(row.buffer_line),
+                    indent_guides: indent_guides_for_line(
+                        self.display.snapshot().text(),
+                        self.display
+                            .snapshot()
+                            .position_map()
+                            .line_start(row.buffer_line)
+                            .unwrap_or(row.start_byte),
+                        self.display
+                            .snapshot()
+                            .position_map()
+                            .line_end(row.buffer_line)
+                            .unwrap_or(row.end_byte),
+                        self.display.config().tab_width,
+                    ),
                     tokens: self
                         .highlights
                         .tokens()
@@ -1471,12 +1486,19 @@ impl InputRouter {
                 point.row.saturating_add(delta as usize)
             }
             .min(surface.display.row_count().saturating_sub(1));
+            let target_column = (*desired).min(
+                surface
+                    .display
+                    .rows()
+                    .get(row)
+                    .map_or(0, |display_row| display_row.display_width),
+            );
             let target = surface
                 .display
                 .display_to_buffer(
                     DisplayPoint {
                         row,
-                        column: *desired,
+                        column: target_column,
                     },
                     Affinity::After,
                 )
@@ -1692,6 +1714,26 @@ fn mouse_to_byte(surface: &EditorSurface, x: f32, y: f32) -> Result<usize, Surfa
         .map_err(SurfaceError::Display)
 }
 
+fn indent_guides_for_line(text: &str, start: usize, end: usize, tab_width: usize) -> Vec<usize> {
+    let Some(line) = text.get(start.min(text.len())..end.min(text.len())) else {
+        return Vec::new();
+    };
+    let tab_width = tab_width.max(1);
+    let mut column = 0;
+    let mut guides = Vec::new();
+    for character in line.chars() {
+        match character {
+            ' ' => column += 1,
+            '\t' => column += tab_width - (column % tab_width),
+            _ => break,
+        }
+        if column > 0 && column % tab_width == 0 {
+            guides.push(column);
+        }
+    }
+    guides
+}
+
 #[cfg(feature = "native-wgpui")]
 pub mod native {
     use super::{
@@ -1703,8 +1745,9 @@ pub mod native {
         DIAGNOSTIC_WARNING_STYLE_ID, SEARCH_CURRENT_MATCH_STYLE_ID, SEARCH_MATCH_STYLE_ID,
     };
     use wgpui::{
-        div, px, Context, FocusHandle, HighlightStyle, InteractiveElement, IntoElement,
-        ParentElement, Render, ScrollDelta, ScrollWheelEvent, Styled, StyledText, Window,
+        div, font, px, Context, FocusHandle, FontFallbacks, HighlightStyle, InteractiveElement,
+        IntoElement, ParentElement, Render, ScrollDelta, ScrollWheelEvent,
+        StatefulInteractiveElement, Styled, StyledText, Window,
     };
 
     /// Native WGPUI editor view backed by the framework-independent surface.
@@ -1713,6 +1756,8 @@ pub mod native {
         pub input_router: InputRouter,
         pub read_only: bool,
         focus_handle: Option<FocusHandle>,
+        dragging: bool,
+        scroll_remainder: f32,
     }
 
     impl WgpuiEditorView {
@@ -1722,6 +1767,8 @@ pub mod native {
                 input_router: InputRouter::default(),
                 read_only: false,
                 focus_handle: None,
+                dragging: false,
+                scroll_remainder: 0.0,
             }
         }
 
@@ -1731,6 +1778,8 @@ pub mod native {
                 input_router: InputRouter::default(),
                 read_only: true,
                 focus_handle: None,
+                dragging: false,
+                scroll_remainder: 0.0,
             }
         }
 
@@ -1795,6 +1844,7 @@ pub mod native {
             cx: &mut Context<Self>,
         ) {
             if event.button == wgpui::MouseButton::Left {
+                self.dragging = true;
                 if let Some(handle) = &self.focus_handle {
                     window.focus(handle, cx);
                 }
@@ -1816,7 +1866,7 @@ pub mod native {
             _window: &mut Window,
             cx: &mut Context<Self>,
         ) {
-            if event.dragging() {
+            if self.dragging || event.dragging() {
                 self.route(
                     InputEvent::Mouse(MouseEvent::Drag {
                         x: event.position.x.as_f32(),
@@ -1834,6 +1884,7 @@ pub mod native {
             cx: &mut Context<Self>,
         ) {
             if event.button == wgpui::MouseButton::Left {
+                self.dragging = false;
                 self.route(
                     InputEvent::Mouse(MouseEvent::Up {
                         x: event.position.x.as_f32(),
@@ -1851,12 +1902,18 @@ pub mod native {
             _window: &mut Window,
             cx: &mut Context<Self>,
         ) {
+            let geometry = self.surface.geometry();
             let (vertical, horizontal) = match event.delta {
-                ScrollDelta::Lines(point) => (point.y.round() as isize, point.x.round() as isize),
+                ScrollDelta::Lines(point) => {
+                    self.scroll_remainder = 0.0;
+                    (point.y.round() as isize, point.x.round() as isize)
+                }
                 ScrollDelta::Pixels(point) => {
-                    let geometry = self.surface.geometry();
+                    let total = self.scroll_remainder + point.y.as_f32();
+                    let vertical = (total / geometry.line_height.max(1.0)).trunc() as isize;
+                    self.scroll_remainder = total - vertical as f32 * geometry.line_height.max(1.0);
                     (
-                        (point.y.as_f32() / geometry.line_height.max(1.0)).round() as isize,
+                        vertical,
                         (point.x.as_f32() / geometry.character_width.max(1.0)).round() as isize,
                     )
                 }
@@ -1872,22 +1929,43 @@ pub mod native {
     }
 
     impl Render for WgpuiEditorView {
-        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             if self.focus_handle.is_none() {
                 self.focus_handle = Some(cx.focus_handle());
             }
+            let editor_font = editor_font();
+            let mut geometry = self.surface.geometry();
+            let font_id = window.text_system().resolve_font(&editor_font);
+            if let Ok(width) = window.text_system().ch_advance(font_id, px(14.0)) {
+                let measured_width = width.as_f32();
+                if measured_width.is_finite()
+                    && measured_width > 0.0
+                    && (measured_width - geometry.character_width).abs() > 0.05
+                {
+                    geometry.character_width = measured_width;
+                    geometry.gutter_character_width = measured_width;
+                    self.surface.set_geometry(geometry);
+                }
+            }
+            let viewport_rows = (geometry.height / geometry.line_height.max(1.0)).floor() as usize;
+            if self.surface.scroll().viewport_rows <= viewport_rows {
+                self.surface.set_viewport(
+                    viewport_rows.saturating_add(1),
+                    self.surface.scroll().viewport_columns,
+                );
+            }
             let frame = self.surface.render_frame();
-            let geometry = self.surface.geometry();
+            geometry = self.surface.geometry();
             let gutter_width = self.surface.gutter_width();
             let code_padding = 12.0;
             let theme = frame.theme;
-            let mut root = div()
+            let root = div()
                 .flex()
                 .flex_col()
                 .size_full()
                 .bg(color(theme.background))
                 .text_color(color(theme.foreground))
-                .font_family("JetBrains Mono")
+                .font(editor_font.clone())
                 .text_size(px(14.0))
                 .line_height(px(geometry.line_height))
                 .track_focus(self.focus_handle.as_ref().unwrap())
@@ -1896,25 +1974,62 @@ pub mod native {
                 .on_mouse_move(cx.listener(Self::on_mouse_move))
                 .on_mouse_up(wgpui::MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_scroll_wheel(cx.listener(Self::on_scroll));
+            let mut rows = div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .relative()
+                .top(px(-self.scroll_remainder));
             for row in frame.rows {
                 let gutter = frame
                     .gutter
                     .rows
                     .iter()
                     .find(|gutter| gutter.display_row == row.display_row);
+                let gutter_marker = frame
+                    .decoration_geometry
+                    .iter()
+                    .find(|decoration| decoration.display_row == row.display_row)
+                    .map(|decoration| {
+                        let color = match decoration.style.id {
+                            DIAGNOSTIC_ERROR_STYLE_ID => SurfaceColor::rgba(248, 113, 113, 255),
+                            DIAGNOSTIC_WARNING_STYLE_ID => SurfaceColor::rgba(251, 191, 36, 255),
+                            DIAGNOSTIC_INFO_STYLE_ID | DIAGNOSTIC_HINT_STYLE_ID => {
+                                SurfaceColor::rgba(96, 165, 250, 255)
+                            }
+                            SEARCH_CURRENT_MATCH_STYLE_ID | SEARCH_MATCH_STYLE_ID => {
+                                SurfaceColor::rgba(192, 132, 252, 255)
+                            }
+                            _ => SurfaceColor::rgba(125, 151, 184, 255),
+                        };
+                        ("●", color)
+                    });
                 let mut code = div()
                     .relative()
                     .flex_1()
                     .h(px(row.height))
                     .pl(px(code_padding))
                     .pr(px(code_padding))
-                    .font_family("JetBrains Mono")
+                    .font(editor_font.clone())
                     .bg(color(if row.active {
                         theme.active_line
                     } else {
                         theme.background
                     }))
                     .whitespace_nowrap();
+                for guide in &row.indent_guides {
+                    code = code.child(
+                        div()
+                            .absolute()
+                            .left(px(
+                                code_padding + *guide as f32 * geometry.character_width - 0.5
+                            ))
+                            .top(px(0.0))
+                            .w(px(1.0))
+                            .h(px(row.height))
+                            .bg(color(SurfaceColor::rgba(57, 72, 96, 150))),
+                    );
+                }
                 for selection in frame
                     .selections
                     .iter()
@@ -1984,7 +2099,7 @@ pub mod native {
                             .bg(color(theme.caret)),
                     );
                 }
-                root = root.child(
+                rows = rows.child(
                     div()
                         .flex()
                         .flex_row()
@@ -1993,11 +2108,14 @@ pub mod native {
                             div()
                                 .h(px(row.height))
                                 .w(px(gutter_width))
-                                .bg(color(theme.gutter_background))
-                                .font_family("JetBrains Mono")
+                                .bg(color(theme.background))
+                                .font(editor_font.clone())
                                 .text_size(px(13.0))
                                 .border_r_1()
-                                .border_color(color(SurfaceColor::rgba(55, 65, 82, 255)))
+                                .border_color(color(theme.background))
+                                .hover(|style| {
+                                    style.border_color(color(SurfaceColor::rgba(77, 104, 137, 255)))
+                                })
                                 .text_color(color(if row.active {
                                     theme.foreground
                                 } else {
@@ -2010,6 +2128,24 @@ pub mod native {
                                         .flex_row()
                                         .justify_end()
                                         .child(
+                                            div()
+                                                .w(px(10.0))
+                                                .text_center()
+                                                .text_color(color(
+                                                    gutter_marker
+                                                        .map(|(_, color)| color)
+                                                        .unwrap_or(SurfaceColor::rgba(0, 0, 0, 0)),
+                                                ))
+                                                .child(
+                                                    gutter_marker
+                                                        .map(|(marker, _)| marker)
+                                                        .unwrap_or(" "),
+                                                ),
+                                        )
+                                        .child({
+                                            let fold_line = gutter
+                                                .filter(|gutter| gutter.foldable)
+                                                .map(|gutter| gutter.buffer_line);
                                             div()
                                                 .w(px(14.0))
                                                 .text_center()
@@ -2032,8 +2168,19 @@ pub mod native {
                                                     } else {
                                                         " "
                                                     },
-                                                ),
-                                        )
+                                                )
+                                                .id(format!(
+                                                    "fold-toggle-{}",
+                                                    fold_line.unwrap_or(usize::MAX)
+                                                ))
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    if let Some(line) = fold_line {
+                                                        this.surface.toggle_fold_at_line(line);
+                                                        cx.notify();
+                                                    }
+                                                }))
+                                        })
                                         .child(
                                             div()
                                                 .w(px(frame.gutter.line_number_width as f32
@@ -2051,8 +2198,18 @@ pub mod native {
                         .child(code),
                 );
             }
-            root
+            root.child(rows)
         }
+    }
+
+    fn editor_font() -> wgpui::Font {
+        let mut font = font("JetBrains Mono");
+        font.fallbacks = Some(FontFallbacks::from_fonts(vec![
+            "Cascadia Mono".to_owned(),
+            "Consolas".to_owned(),
+            "monospace".to_owned(),
+        ]));
+        font
     }
 
     fn color(color: SurfaceColor) -> wgpui::Hsla {
@@ -2074,6 +2231,43 @@ pub mod native {
             DIAGNOSTIC_INFO_STYLE_ID => SurfaceColor::rgba(80, 150, 220, 255),
             DIAGNOSTIC_HINT_STYLE_ID => SurfaceColor::rgba(120, 190, 140, 255),
             _ => theme.decoration,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use mockaco_renderer::{DisplayConfig, FoldRegion};
+
+        #[test]
+        fn native_presentation_keeps_gutter_and_code_geometry_aligned() {
+            let surface = EditorSurface::new(
+                "fn main() {\n    // visible\n    let value = 7;\n}\n",
+                DisplayConfig::unwrapped(),
+                Default::default(),
+            );
+            let frame = surface.render_frame();
+            assert!(surface.gutter_width() >= 10.0);
+            assert_eq!(frame.gutter.rows.len(), frame.rows.len());
+            assert!(frame.gutter.rows.iter().any(|row| row.foldable));
+            assert!(frame.rows.iter().any(|row| !row.tokens.is_empty()));
+        }
+
+        #[test]
+        fn native_presentation_exposes_fold_marker_and_active_selection_contrast() {
+            let mut surface = EditorSurface::new(
+                "fn main() {\n    let value = 7;\n}\n",
+                DisplayConfig::unwrapped(),
+                Default::default(),
+            );
+            surface.set_folds(mockaco_renderer::FoldSet::with_foldable(
+                [FoldRegion::new(0, 3)],
+                [FoldRegion::new(0, 3)],
+            ));
+            let frame = surface.render_frame();
+            assert!(frame.gutter.rows[0].folded);
+            assert_ne!(frame.theme.active_line, frame.theme.background);
+            assert_ne!(frame.theme.primary_selection, frame.theme.background);
         }
     }
 }
@@ -2243,6 +2437,33 @@ mod tests {
             .unwrap(),
             Some(EditCommand::MovePageDown { extend: false })
         );
+    }
+
+    #[test]
+    fn vertical_navigation_clamps_to_the_last_slot_on_shorter_lines() {
+        let mut surface = EditorSurface::new(
+            "abcdef\nx\n",
+            DisplayConfig::unwrapped(),
+            SurfaceGeometry::default(),
+        );
+        surface.editor_mut().set_selections(SelectionSet::caret(5));
+        InputRouter::default()
+            .route(
+                &mut surface,
+                InputEvent::Key(KeyEvent {
+                    key: Key::Down,
+                    modifiers: KeyModifiers::default(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(surface.editor().selections().primary().unwrap().head, 8);
+    }
+
+    #[test]
+    fn render_frame_exposes_four_column_indent_guides_for_spaces_and_tabs() {
+        let surface = surface("fn main() {\n\t    let value = 1;\n}\n");
+        let frame = surface.render_frame();
+        assert_eq!(frame.rows[1].indent_guides, vec![4, 8]);
     }
 
     #[test]

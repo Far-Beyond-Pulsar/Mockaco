@@ -809,6 +809,7 @@ pub fn map_range(changes: &ChangeMap, range: Range<usize>) -> Range<usize> {
 mod tests {
     use super::*;
     use mockaco_core::{Document, Transaction};
+    use std::sync::Arc;
 
     #[test]
     fn registry_detects_extensions_case_insensitively() {
@@ -829,6 +830,16 @@ mod tests {
             registry.register(LanguageConfig::new("other").extension("rs")),
             Err(RegistryError::DuplicateExtension { .. })
         ));
+    }
+
+    #[test]
+    fn provider_registry_keeps_parser_types_behind_language_ids() {
+        let provider = Arc::new(RustTreeSitterProvider::new().unwrap());
+        let mut registry = LanguageProviderRegistry::default();
+        registry.register_highlighter(LanguageId::new("rust"), provider.clone());
+        registry.register_folder(LanguageId::new("rust"), provider);
+        assert!(registry.highlighter(&LanguageId::new("RUST")).is_some());
+        assert!(registry.folder(&LanguageId::new("rust")).is_some());
     }
 
     #[test]
