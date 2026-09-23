@@ -1,4 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/mockaco-core"]
-
+members = [
+    "crates/mockaco-core",
+    "crates/mockaco-language",
+    "crates/mockaco-renderer",
+]

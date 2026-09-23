@@ -5,3 +5,17 @@ version = 4
 [[package]]
 name = "mockaco-core"
 version = "0.1.0"
+
+[[package]]
+name = "mockaco-language"
+version = "0.1.0"
+dependencies = [
+ "mockaco-core",
+]
+
+[[package]]
+name = "mockaco-renderer"
+version = "0.1.0"
+dependencies = [
+ "mockaco-core",
+]

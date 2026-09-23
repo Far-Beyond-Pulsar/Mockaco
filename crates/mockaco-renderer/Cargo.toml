@@ -1,0 +1,13 @@
+[package]
+name = "mockaco-renderer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Framework-independent display mapping for Mockaco"
+
+[dependencies]
+mockaco-core = { path = "../mockaco-core" }
+
+[lib]
+path = "src/lib.rs"
+
