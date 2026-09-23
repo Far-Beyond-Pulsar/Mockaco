@@ -295,6 +295,7 @@ impl Render for Showcase {
         let main_editor = div()
             .flex()
             .flex_1()
+            .min_h(px(0.0))
             .min_w(px(500.0))
             .flex_col()
             .border_1()
@@ -309,7 +310,7 @@ impl Render for Showcase {
                     .text_color(rgb(0x9db2cd))
                     .child("main.rs  •  Rust  •  live editor"),
             )
-            .child(self.editor.clone());
+            .child(div().flex_1().min_h(px(0.0)).child(self.editor.clone()));
         let content = if self.show_diff {
             div()
                 .flex()
@@ -320,6 +321,7 @@ impl Render for Showcase {
                         .flex()
                         .flex_col()
                         .flex_1()
+                        .min_h(px(0.0))
                         .border_1()
                         .border_color(rgb(0x2a3b54))
                         .bg(rgb(0x111a27))
@@ -332,13 +334,19 @@ impl Render for Showcase {
                                 .text_color(rgb(0x8fa4bd))
                                 .child("ORIGINAL  •  read-only"),
                         )
-                        .child(self.diff_original.clone()),
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .child(self.diff_original.clone()),
+                        ),
                 )
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .flex_1()
+                        .min_h(px(0.0))
                         .border_1()
                         .border_color(rgb(0x2a3b54))
                         .bg(rgb(0x111a27))
@@ -351,7 +359,12 @@ impl Render for Showcase {
                                 .text_color(rgb(0xa5c9b0))
                                 .child("MODIFIED  •  editable"),
                         )
-                        .child(self.diff_modified.clone()),
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .child(self.diff_modified.clone()),
+                        ),
                 )
         } else {
             main_editor
@@ -379,6 +392,9 @@ impl Render for Showcase {
             .child(
                 div()
                     .flex_1()
+                    .flex()
+                    .flex_col()
+                    .min_h(px(0.0))
                     .p_3()
                     .child(content),
             )

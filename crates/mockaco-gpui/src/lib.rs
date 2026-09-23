@@ -1946,9 +1946,11 @@ pub mod native {
         DIAGNOSTIC_WARNING_STYLE_ID, SEARCH_CURRENT_MATCH_STYLE_ID, SEARCH_MATCH_STYLE_ID,
     };
     use wgpui::{
-        div, font, px, ClipboardItem, Context, FocusHandle, FontFallbacks, HighlightStyle,
-        InteractiveElement, IntoElement, ParentElement, Render, ScrollDelta, ScrollWheelEvent,
-        StatefulInteractiveElement, Styled, StyledText, Window,
+        div, fill, font, point, px, size, ClipboardItem, Context, DispatchPhase, Element,
+        ElementId, Entity, FocusHandle, FontFallbacks, GlobalElementId, HighlightStyle,
+        InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseDownEvent,
+        MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollDelta, ScrollWheelEvent,
+        StatefulInteractiveElement, Style, Styled, StyledText, Window,
     };
 
     /// Native WGPUI editor view backed by the framework-independent surface.
@@ -1959,6 +1961,7 @@ pub mod native {
         focus_handle: Option<FocusHandle>,
         dragging: bool,
         scroll_remainder: f32,
+        scrollbar_drag: Option<ScrollbarDrag>,
     }
 
     impl WgpuiEditorView {
@@ -1970,6 +1973,7 @@ pub mod native {
                 focus_handle: None,
                 dragging: false,
                 scroll_remainder: 0.0,
+                scrollbar_drag: None,
             }
         }
 
@@ -1981,6 +1985,7 @@ pub mod native {
                 focus_handle: None,
                 dragging: false,
                 scroll_remainder: 0.0,
+                scrollbar_drag: None,
             }
         }
 
@@ -2136,6 +2141,40 @@ pub mod native {
             }
         }
 
+        fn begin_scrollbar_drag(&mut self, pointer_y: f32) {
+            let track_height = self.surface.geometry().height;
+            let Some(scrollbar) = scrollbar_geometry(self.surface.scroll(), track_height) else {
+                return;
+            };
+            let grab_offset = if (scrollbar.thumb_top
+                ..=scrollbar.thumb_top + scrollbar.thumb_height)
+                .contains(&pointer_y)
+            {
+                pointer_y - scrollbar.thumb_top
+            } else {
+                scrollbar.thumb_height * 0.5
+            };
+            self.scrollbar_drag = Some(ScrollbarDrag { grab_offset });
+            self.scrollbar_drag_to(pointer_y, ScrollbarDrag { grab_offset });
+        }
+
+        fn scrollbar_drag_to(&mut self, pointer_y: f32, drag: ScrollbarDrag) -> bool {
+            let track_height = self.surface.geometry().height;
+            let scroll = self.surface.scroll();
+            let Some(scrollbar) = scrollbar_geometry(scroll, track_height) else {
+                return false;
+            };
+            let row = scrollbar_row_for_position(
+                scroll,
+                track_height,
+                scrollbar.thumb_height,
+                pointer_y,
+                drag.grab_offset,
+            );
+            self.scroll_remainder = 0.0;
+            self.surface.scroll_to(row, scroll.horizontal_columns)
+        }
+
         fn on_scroll(
             &mut self,
             event: &ScrollWheelEvent,
@@ -2199,6 +2238,156 @@ pub mod native {
         thumb_height: f32,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct ScrollbarDrag {
+        grab_offset: f32,
+    }
+
+    struct EditorScrollbar {
+        editor: Entity<WgpuiEditorView>,
+        track_height: f32,
+        scrollbar: ScrollbarGeometry,
+    }
+
+    impl EditorScrollbar {
+        fn new(
+            editor: Entity<WgpuiEditorView>,
+            track_height: f32,
+            scrollbar: ScrollbarGeometry,
+        ) -> Self {
+            Self {
+                editor,
+                track_height,
+                scrollbar,
+            }
+        }
+    }
+
+    impl IntoElement for EditorScrollbar {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    impl Element for EditorScrollbar {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut wgpui::App,
+        ) -> (LayoutId, Self::RequestLayoutState) {
+            let style = Style {
+                size: size(px(8.0).into(), px(self.track_height).into()),
+                ..Style::default()
+            };
+            (window.request_layout(style, [], cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: wgpui::Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _window: &mut Window,
+            _cx: &mut wgpui::App,
+        ) -> Self::PrepaintState {
+        }
+
+        fn paint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            bounds: wgpui::Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _prepaint: &mut Self::PrepaintState,
+            window: &mut Window,
+            _cx: &mut wgpui::App,
+        ) {
+            window.paint_quad(fill(bounds, color(SurfaceColor::rgba(13, 20, 32, 80))));
+            window.paint_quad(
+                fill(
+                    wgpui::Bounds {
+                        origin: point(
+                            bounds.origin.x,
+                            bounds.origin.y + px(self.scrollbar.thumb_top),
+                        ),
+                        size: size(bounds.size.width, px(self.scrollbar.thumb_height)),
+                    },
+                    color(SurfaceColor::rgba(122, 151, 187, 190)),
+                )
+                .corner_radii(wgpui::Corners::all(px(3.0))),
+            );
+
+            let editor = self.editor.clone();
+            window.on_mouse_event(move |event: &MouseDownEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble || event.button != wgpui::MouseButton::Left {
+                    return;
+                }
+                let pointer_y = (event.position.y - bounds.origin.y).as_f32();
+                if !bounds.contains(&event.position) {
+                    return;
+                }
+                cx.stop_propagation();
+                editor.update(cx, |view, cx| {
+                    view.begin_scrollbar_drag(pointer_y);
+                    cx.notify();
+                });
+            });
+
+            let editor = self.editor.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let pointer_y = (event.position.y - bounds.origin.y).as_f32();
+                let mut changed = false;
+                editor.update(cx, |view, cx| {
+                    if let Some(drag) = view.scrollbar_drag {
+                        changed = view.scrollbar_drag_to(pointer_y, drag);
+                        if changed {
+                            cx.notify();
+                        }
+                    }
+                });
+                if changed {
+                    cx.stop_propagation();
+                }
+            });
+
+            let editor = self.editor.clone();
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble || event.button != wgpui::MouseButton::Left {
+                    return;
+                }
+                let mut stopped = false;
+                editor.update(cx, |view, _cx| {
+                    if view.scrollbar_drag.take().is_some() {
+                        view.scroll_remainder = 0.0;
+                        stopped = true;
+                    }
+                });
+                if stopped {
+                    cx.stop_propagation();
+                }
+            });
+        }
+    }
+
     fn scrollbar_geometry(
         scroll: super::ScrollState,
         track_height: f32,
@@ -2220,6 +2409,22 @@ pub mod native {
             thumb_top,
             thumb_height,
         })
+    }
+
+    fn scrollbar_row_for_position(
+        scroll: super::ScrollState,
+        track_height: f32,
+        thumb_height: f32,
+        pointer_y: f32,
+        grab_offset: f32,
+    ) -> usize {
+        let travel = (track_height - thumb_height).max(0.0);
+        let max_row = scroll.content_rows.saturating_sub(scroll.viewport_rows);
+        if travel <= 0.0 || max_row == 0 {
+            return 0;
+        }
+        let thumb_top = (pointer_y - grab_offset).clamp(0.0, travel);
+        ((thumb_top / travel) * max_row as f32).round() as usize
     }
 
     impl Render for WgpuiEditorView {
@@ -2511,17 +2716,12 @@ pub mod native {
                         .right(px(4.0))
                         .w(px(8.0))
                         .h(px(geometry.height))
-                        .bg(color(SurfaceColor::rgba(13, 20, 32, 80)))
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(scrollbar.thumb_top))
-                                .right(px(0.0))
-                                .w(px(8.0))
-                                .h(px(scrollbar.thumb_height))
-                                .rounded_sm()
-                                .bg(color(SurfaceColor::rgba(122, 151, 187, 190))),
-                        ),
+                        .cursor_pointer()
+                        .child(EditorScrollbar::new(
+                            cx.entity(),
+                            geometry.height,
+                            scrollbar,
+                        )),
                 );
             }
             root.child(rows)
@@ -2620,6 +2820,26 @@ pub mod native {
             assert!(bottom.thumb_top > top.thumb_top);
             assert!(bottom.thumb_top + bottom.thumb_height <= 400.0);
             assert!(scrollbar_geometry(scroll, 0.0).is_none());
+        }
+
+        #[test]
+        fn scrollbar_track_positions_map_to_document_rows() {
+            let mut scroll = crate::ScrollState::default();
+            scroll.set_viewport(10, 80);
+            scroll.set_content_with_bottom_padding(100, 80, 1);
+            let geometry = scrollbar_geometry(scroll, 400.0).unwrap();
+
+            let middle = scrollbar_row_for_position(
+                scroll,
+                400.0,
+                geometry.thumb_height,
+                200.0,
+                geometry.thumb_height * 0.5,
+            );
+            let bottom =
+                scrollbar_row_for_position(scroll, 400.0, geometry.thumb_height, 400.0, 0.0);
+            assert!(middle > 40 && middle < 60);
+            assert_eq!(bottom, scroll.content_rows - scroll.viewport_rows);
         }
     }
 }
