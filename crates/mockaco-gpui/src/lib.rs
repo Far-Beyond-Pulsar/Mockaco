@@ -32,6 +32,11 @@ pub struct SurfaceGeometry {
     pub gutter_character_width: f32,
 }
 
+/// Horizontal breathing room between the gutter and the first code column in
+/// the native presentation. Mouse hit testing uses the same constant as paint
+/// so a click lands on the glyph under the pointer.
+const CODE_PADDING: f32 = 12.0;
+
 impl Default for SurfaceGeometry {
     fn default() -> Self {
         Self {
@@ -799,6 +804,30 @@ impl EditorSurface {
         changed
     }
 
+    /// Keeps the primary caret inside the logical viewport after navigation or
+    /// an edit. The native adapter may animate the resulting one-row changes,
+    /// but the invariant is owned by the framework-independent surface.
+    pub fn reveal_primary_caret(&mut self) -> bool {
+        let Some(selection) = self.editor.selections().primary() else {
+            return false;
+        };
+        let Ok(point) = self
+            .display
+            .buffer_to_display(selection.cursor(), Affinity::After)
+        else {
+            return false;
+        };
+        let viewport_rows = self.scroll.viewport_rows.max(1);
+        let target_row = if point.row < self.scroll.top_row {
+            point.row
+        } else if point.row >= self.scroll.top_row.saturating_add(viewport_rows) {
+            point.row.saturating_sub(viewport_rows.saturating_sub(1))
+        } else {
+            self.scroll.top_row
+        };
+        self.scroll_to(target_row, self.scroll.horizontal_columns)
+    }
+
     pub fn invalidation(&self) -> &InvalidationState {
         &self.invalidation
     }
@@ -1392,7 +1421,7 @@ impl InputRouter {
         surface: &mut EditorSurface,
         event: InputEvent,
     ) -> Result<InputOutcome, SurfaceError> {
-        match event {
+        let mut outcome = match event {
             InputEvent::Text(text) => self.apply_command(surface, EditCommand::InsertText(text)),
             InputEvent::Paste(text) => self.apply_command(surface, EditCommand::Paste(text)),
             InputEvent::Key(event) => {
@@ -1411,7 +1440,11 @@ impl InputRouter {
             }
             InputEvent::Ime(event) => self.route_ime(surface, event),
             InputEvent::Mouse(event) => self.route_mouse(surface, event),
+        }?;
+        if outcome.selection_changed || outcome.document_changed {
+            outcome.scroll_changed |= surface.reveal_primary_caret();
         }
+        Ok(outcome)
     }
 
     fn apply_command(
@@ -1896,7 +1929,7 @@ fn mouse_to_byte(surface: &EditorSurface, x: f32, y: f32) -> Result<usize, Surfa
         .scroll
         .top_row
         .saturating_add((y / surface.geometry.line_height).floor() as usize);
-    let code_x = (x - surface.gutter_width()).max(0.0);
+    let code_x = (x - surface.gutter_width() - CODE_PADDING).max(0.0);
     let column = (code_x / surface.geometry.character_width.max(1.0)).floor() as usize;
     surface
         .display
@@ -1939,7 +1972,7 @@ fn indent_guides_for_line(text: &str, start: usize, end: usize, tab_width: usize
 pub mod native {
     use super::{
         EditorSurface, InputEvent, InputRouter, Key, KeyEvent, KeyModifiers, MouseButton,
-        MouseEvent, RenderFrame, SurfaceColor,
+        MouseEvent, RenderFrame, SurfaceColor, CODE_PADDING,
     };
     use mockaco_renderer::{
         DIAGNOSTIC_ERROR_STYLE_ID, DIAGNOSTIC_HINT_STYLE_ID, DIAGNOSTIC_INFO_STYLE_ID,
@@ -1950,7 +1983,7 @@ pub mod native {
         ElementId, Entity, FocusHandle, FontFallbacks, GlobalElementId, HighlightStyle,
         InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseDownEvent,
         MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollDelta, ScrollWheelEvent,
-        StatefulInteractiveElement, Style, Styled, StyledText, Window,
+        Size, StatefulInteractiveElement, Style, Styled, StyledText, Window,
     };
 
     /// Native WGPUI editor view backed by the framework-independent surface.
@@ -1961,6 +1994,7 @@ pub mod native {
         focus_handle: Option<FocusHandle>,
         dragging: bool,
         scroll_remainder: f32,
+        scroll_animation: bool,
         scrollbar_drag: Option<ScrollbarDrag>,
     }
 
@@ -1973,6 +2007,7 @@ pub mod native {
                 focus_handle: None,
                 dragging: false,
                 scroll_remainder: 0.0,
+                scroll_animation: false,
                 scrollbar_drag: None,
             }
         }
@@ -1985,6 +2020,7 @@ pub mod native {
                 focus_handle: None,
                 dragging: false,
                 scroll_remainder: 0.0,
+                scroll_animation: false,
                 scrollbar_drag: None,
             }
         }
@@ -2005,7 +2041,21 @@ pub mod native {
             {
                 return;
             }
-            if self.input_router.route(&mut self.surface, event).is_ok() {
+            let is_scroll = matches!(&event, InputEvent::Scroll { .. });
+            let before_top = self.surface.scroll().top_row;
+            if let Ok(outcome) = self.input_router.route(&mut self.surface, event) {
+                if outcome.scroll_changed && !is_scroll {
+                    let after_top = self.surface.scroll().top_row;
+                    let delta = after_top as i64 - before_top as i64;
+                    if delta.abs() <= 1 && delta != 0 {
+                        self.scroll_remainder =
+                            -(delta as f32) * self.surface.geometry().line_height.max(1.0);
+                        self.scroll_animation = true;
+                    } else {
+                        self.scroll_remainder = 0.0;
+                        self.scroll_animation = false;
+                    }
+                }
                 cx.notify();
             }
         }
@@ -2082,66 +2132,8 @@ pub mod native {
             self.route(InputEvent::Key(KeyEvent { key, modifiers }), cx);
         }
 
-        fn on_mouse_down(
-            &mut self,
-            event: &wgpui::MouseDownEvent,
-            window: &mut Window,
-            cx: &mut Context<Self>,
-        ) {
-            if event.button == wgpui::MouseButton::Left {
-                self.dragging = true;
-                if let Some(handle) = &self.focus_handle {
-                    window.focus(handle, cx);
-                }
-                self.route(
-                    InputEvent::Mouse(MouseEvent::Down {
-                        x: event.position.x.as_f32(),
-                        y: event.position.y.as_f32() + self.scroll_remainder,
-                        button: MouseButton::Primary,
-                        click_count: event.click_count,
-                    }),
-                    cx,
-                );
-            }
-        }
-
-        fn on_mouse_move(
-            &mut self,
-            event: &wgpui::MouseMoveEvent,
-            _window: &mut Window,
-            cx: &mut Context<Self>,
-        ) {
-            if self.dragging || event.dragging() {
-                self.route(
-                    InputEvent::Mouse(MouseEvent::Drag {
-                        x: event.position.x.as_f32(),
-                        y: event.position.y.as_f32() + self.scroll_remainder,
-                    }),
-                    cx,
-                );
-            }
-        }
-
-        fn on_mouse_up(
-            &mut self,
-            event: &wgpui::MouseUpEvent,
-            _window: &mut Window,
-            cx: &mut Context<Self>,
-        ) {
-            if event.button == wgpui::MouseButton::Left {
-                self.dragging = false;
-                self.route(
-                    InputEvent::Mouse(MouseEvent::Up {
-                        x: event.position.x.as_f32(),
-                        y: event.position.y.as_f32() + self.scroll_remainder,
-                        button: MouseButton::Primary,
-                    }),
-                    cx,
-                );
-            }
-        }
-
         fn begin_scrollbar_drag(&mut self, pointer_y: f32) {
+            self.scroll_animation = false;
             let track_height = self.surface.geometry().height;
             let Some(scrollbar) = scrollbar_geometry(self.surface.scroll(), track_height) else {
                 return;
@@ -2172,6 +2164,7 @@ pub mod native {
                 drag.grab_offset,
             );
             self.scroll_remainder = 0.0;
+            self.scroll_animation = false;
             self.surface.scroll_to(row, scroll.horizontal_columns)
         }
 
@@ -2181,6 +2174,7 @@ pub mod native {
             _window: &mut Window,
             cx: &mut Context<Self>,
         ) {
+            self.scroll_animation = false;
             let geometry = self.surface.geometry();
             let (vertical, horizontal) = match event.delta {
                 ScrollDelta::Lines(point) => {
@@ -2241,6 +2235,169 @@ pub mod native {
     #[derive(Debug, Clone, Copy, PartialEq)]
     struct ScrollbarDrag {
         grab_offset: f32,
+    }
+
+    struct EditorInputLayer {
+        editor: Entity<WgpuiEditorView>,
+        x_offset: f32,
+    }
+
+    impl EditorInputLayer {
+        fn new(editor: Entity<WgpuiEditorView>, x_offset: f32) -> Self {
+            Self { editor, x_offset }
+        }
+    }
+
+    impl IntoElement for EditorInputLayer {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    impl Element for EditorInputLayer {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut wgpui::App,
+        ) -> (LayoutId, Self::RequestLayoutState) {
+            let style = Style {
+                size: Size::full(),
+                ..Style::default()
+            };
+            (window.request_layout(style, [], cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: wgpui::Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _window: &mut Window,
+            _cx: &mut wgpui::App,
+        ) -> Self::PrepaintState {
+        }
+
+        fn paint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            bounds: wgpui::Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _prepaint: &mut Self::PrepaintState,
+            window: &mut Window,
+            _cx: &mut wgpui::App,
+        ) {
+            let editor = self.editor.clone();
+            let x_offset = self.x_offset;
+            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble
+                    || event.button != wgpui::MouseButton::Left
+                    || !bounds.contains(&event.position)
+                {
+                    return;
+                }
+                let (x, y) = local_mouse_point(bounds, event.position, x_offset);
+                cx.stop_propagation();
+                editor.update(cx, |view, cx| {
+                    view.dragging = true;
+                    if let Some(handle) = &view.focus_handle {
+                        window.focus(handle, cx);
+                    }
+                    view.route(
+                        InputEvent::Mouse(MouseEvent::Down {
+                            x,
+                            y: y + view.scroll_remainder,
+                            button: MouseButton::Primary,
+                            click_count: event.click_count,
+                        }),
+                        cx,
+                    );
+                });
+            });
+
+            let editor = self.editor.clone();
+            let x_offset = self.x_offset;
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let dragging = event.dragging();
+                let (x, y) = local_mouse_point(bounds, event.position, x_offset);
+                let mut handled = false;
+                editor.update(cx, |view, cx| {
+                    if view.scrollbar_drag.is_none() && (view.dragging || dragging) {
+                        handled = true;
+                        view.route(
+                            InputEvent::Mouse(MouseEvent::Drag {
+                                x,
+                                y: y + view.scroll_remainder,
+                            }),
+                            cx,
+                        );
+                    }
+                });
+                if handled {
+                    cx.stop_propagation();
+                }
+            });
+
+            let editor = self.editor.clone();
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble || event.button != wgpui::MouseButton::Left {
+                    return;
+                }
+                let mut handled = false;
+                editor.update(cx, |view, cx| {
+                    if view.dragging {
+                        handled = true;
+                        view.dragging = false;
+                        view.route(
+                            InputEvent::Mouse(MouseEvent::Up {
+                                x: 0.0,
+                                y: 0.0,
+                                button: MouseButton::Primary,
+                            }),
+                            cx,
+                        );
+                    }
+                });
+                if handled {
+                    cx.stop_propagation();
+                }
+            });
+        }
+    }
+
+    fn local_mouse_point(
+        bounds: wgpui::Bounds<Pixels>,
+        position: wgpui::Point<Pixels>,
+        x_offset: f32,
+    ) -> (f32, f32) {
+        let local_x = (position.x - bounds.origin.x)
+            .as_f32()
+            .clamp(0.0, bounds.size.width.as_f32());
+        (
+            local_x + x_offset,
+            (position.y - bounds.origin.y)
+                .as_f32()
+                .clamp(0.0, bounds.size.height.as_f32()),
+        )
     }
 
     struct EditorScrollbar {
@@ -2429,6 +2586,15 @@ pub mod native {
 
     impl Render for WgpuiEditorView {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            if self.scroll_animation {
+                self.scroll_remainder *= 0.72;
+                if self.scroll_remainder.abs() < 0.25 {
+                    self.scroll_remainder = 0.0;
+                    self.scroll_animation = false;
+                } else {
+                    window.request_animation_frame();
+                }
+            }
             if self.focus_handle.is_none() {
                 self.focus_handle = Some(cx.focus_handle());
             }
@@ -2456,7 +2622,7 @@ pub mod native {
             let frame = self.surface.render_frame_with_buffer(1);
             geometry = self.surface.geometry();
             let gutter_width = self.surface.gutter_width();
-            let code_padding = 12.0;
+            let code_padding = CODE_PADDING;
             let theme = frame.theme;
             let root = div()
                 .flex()
@@ -2469,10 +2635,6 @@ pub mod native {
                 .line_height(px(geometry.line_height))
                 .track_focus(self.focus_handle.as_ref().unwrap())
                 .on_key_down(cx.listener(Self::on_key_down))
-                .on_mouse_down(wgpui::MouseButton::Left, cx.listener(Self::on_mouse_down))
-                .on_mouse_move(cx.listener(Self::on_mouse_move))
-                .on_mouse_up(wgpui::MouseButton::Left, cx.listener(Self::on_mouse_up))
-                .on_mouse_up_out(wgpui::MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_scroll_wheel(cx.listener(Self::on_scroll));
             let mut row_stack = div()
                 .flex()
@@ -2708,6 +2870,15 @@ pub mod native {
                 .relative()
                 .child(row_stack);
             let mut rows = rows;
+            rows = rows.child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(gutter_width))
+                    .right(px(16.0))
+                    .bottom(px(0.0))
+                    .child(EditorInputLayer::new(cx.entity(), gutter_width)),
+            );
             if let Some(scrollbar) = scrollbar_geometry(self.surface.scroll(), geometry.height) {
                 rows = rows.child(
                     div()
@@ -2840,6 +3011,18 @@ pub mod native {
                 scrollbar_row_for_position(scroll, 400.0, geometry.thumb_height, 400.0, 0.0);
             assert!(middle > 40 && middle < 60);
             assert_eq!(bottom, scroll.content_rows - scroll.viewport_rows);
+        }
+
+        #[test]
+        fn window_mouse_positions_are_translated_from_hitbox_bounds() {
+            let bounds = wgpui::Bounds {
+                origin: point(px(100.0), px(200.0)),
+                size: size(px(400.0), px(300.0)),
+            };
+            assert_eq!(
+                local_mouse_point(bounds, point(px(140.0), px(240.0)), 56.0),
+                (96.0, 40.0)
+            );
         }
     }
 }
@@ -3010,6 +3193,49 @@ mod tests {
             surface.editor().selections().selections()[0],
             Selection::range(2, 1)
         );
+    }
+
+    #[test]
+    fn navigation_and_paste_reveal_the_primary_caret() {
+        let mut surface = EditorSurface::new(
+            (0..12)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            DisplayConfig::unwrapped(),
+            SurfaceGeometry {
+                height: 66.0,
+                ..SurfaceGeometry::default()
+            },
+        );
+        surface.set_viewport(3, 40);
+        let mut router = InputRouter::default();
+        for _ in 0..10 {
+            router
+                .route(
+                    &mut surface,
+                    InputEvent::Key(KeyEvent {
+                        key: Key::Down,
+                        modifiers: KeyModifiers::default(),
+                    }),
+                )
+                .unwrap();
+        }
+        assert!(surface.scroll().top_row > 0);
+        router
+            .route(&mut surface, InputEvent::Paste("\n".repeat(12)))
+            .unwrap();
+        let caret_row = surface
+            .display()
+            .buffer_to_display(
+                surface.editor().selections().primary().unwrap().cursor(),
+                Affinity::After,
+            )
+            .unwrap()
+            .row;
+        assert!(caret_row >= surface.scroll().top_row);
+        assert!(caret_row < surface.scroll().top_row + surface.scroll().viewport_rows);
+        assert!(surface.scroll().top_row > 0);
     }
 
     #[test]
@@ -3240,7 +3466,7 @@ mod tests {
             .route(
                 &mut surface,
                 InputEvent::Mouse(MouseEvent::Down {
-                    x: 64.0,
+                    x: 76.0,
                     y: 0.0,
                     button: MouseButton::Primary,
                     click_count: 1,
@@ -3250,7 +3476,7 @@ mod tests {
         router
             .route(
                 &mut surface,
-                InputEvent::Mouse(MouseEvent::Drag { x: 64.0, y: 20.0 }),
+                InputEvent::Mouse(MouseEvent::Drag { x: 76.0, y: 20.0 }),
             )
             .unwrap();
         assert_eq!(
