@@ -501,6 +501,40 @@ impl EditorSurface {
         );
     }
 
+    /// Replaces the surface document for host-driven load/external-change
+    /// flows while preserving the current display configuration.
+    pub fn replace_text(&mut self, text: impl Into<String>) {
+        self.editor = EditorState::new(text);
+        let config = self.display.config().clone();
+        self.display = DisplayMap::new(&self.editor.snapshot(), config);
+        self.recompute_scroll_viewport();
+        self.invalidation.push(InvalidationKind::Document, None);
+    }
+
+    /// Applies an undo and rebuilds the renderer-neutral display map.
+    pub fn undo(&mut self) -> bool {
+        if !self.editor.undo() {
+            return false;
+        }
+        self.rebuild_display_after_history_change();
+        true
+    }
+
+    /// Applies a redo and rebuilds the renderer-neutral display map.
+    pub fn redo(&mut self) -> bool {
+        if !self.editor.redo() {
+            return false;
+        }
+        self.rebuild_display_after_history_change();
+        true
+    }
+
+    pub fn set_folds(&mut self, folds: mockaco_renderer::FoldSet) {
+        self.display.set_folds(folds);
+        self.recompute_scroll_viewport();
+        self.invalidation.push(InvalidationKind::Geometry, None);
+    }
+
     pub fn set_search_and_diagnostic_decorations(
         &mut self,
         search: Option<&SearchSession>,
@@ -748,6 +782,14 @@ impl EditorSurface {
             .unwrap_or(0);
         self.scroll.set_viewport(rows, columns);
         self.scroll.set_content(self.display.row_count(), max_width);
+    }
+
+    fn rebuild_display_after_history_change(&mut self) {
+        let config = self.display.config().clone();
+        let folds = self.display.folds().clone();
+        self.display = DisplayMap::with_folds(&self.editor.snapshot(), config, folds);
+        self.recompute_scroll_viewport();
+        self.invalidation.push(InvalidationKind::Document, None);
     }
 }
 
@@ -1280,6 +1322,7 @@ pub mod native {
     pub struct WgpuiEditorView {
         pub surface: EditorSurface,
         pub input_router: InputRouter,
+        pub read_only: bool,
         focus_handle: Option<FocusHandle>,
     }
 
@@ -1288,6 +1331,16 @@ pub mod native {
             Self {
                 surface,
                 input_router: InputRouter::default(),
+                read_only: false,
+                focus_handle: None,
+            }
+        }
+
+        pub fn new_read_only(surface: EditorSurface) -> Self {
+            Self {
+                surface,
+                input_router: InputRouter::default(),
+                read_only: true,
                 focus_handle: None,
             }
         }
@@ -1297,6 +1350,14 @@ pub mod native {
         }
 
         fn route(&mut self, event: InputEvent, cx: &mut Context<Self>) {
+            if self.read_only
+                && matches!(
+                    &event,
+                    InputEvent::Text(_) | InputEvent::Key(_) | InputEvent::Ime(_)
+                )
+            {
+                return;
+            }
             if self.input_router.route(&mut self.surface, event).is_ok() {
                 cx.notify();
             }

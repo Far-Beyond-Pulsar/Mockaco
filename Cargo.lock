@@ -3165,6 +3165,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mockaco-example"
+version = "0.1.0"
+dependencies = [
+ "mockaco-core",
+ "mockaco-diff",
+ "mockaco-gpui",
+ "mockaco-lsp",
+ "mockaco-renderer",
+ "wgpui",
+]
+
+[[package]]
 name = "mockaco-fixtures"
 version = "0.1.0"
 dependencies = [

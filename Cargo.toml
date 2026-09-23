@@ -9,4 +9,5 @@ members = [
     "crates/mockaco-diff",
     "crates/mockaco-fixtures",
     "crates/mockaco-bench",
+    "crates/mockaco-example",
 ]
