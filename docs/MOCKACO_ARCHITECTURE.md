@@ -245,6 +245,32 @@ Host integrations receive typed events such as `DocumentChanged`,
 `SelectionChanged`, `SaveRequested`, `NavigateRequested`, and
 `CompletionAccepted`. They should not reach into renderer internals.
 
+## Syntax, navigation, and folding boundary
+
+`mockaco-language` owns parser-backed derived data. The initial concrete
+provider is `RustTreeSitterProvider`, which uses the real Rust grammar,
+highlight query, parser tree edits, and query captures. It publishes
+versioned, UTF-8 byte-safe `SyntaxToken` ranges and `FoldRange` values. The
+`LanguageProviderRegistry` is the registration seam for future grammars; the
+core and renderer do not depend on Tree-sitter types.
+
+`mockaco-gpui` accepts those results outside its paint path. Results are
+published only when their document version matches the current snapshot, and
+the last accepted highlight/fold state remains paintable while a newer result
+is unavailable. The renderer maps syntax ranges onto visible rows and maps
+foldable ranges through transactions so active folds, line numbers, hit
+testing, caret visibility, wrapping, and scrolling share one display map.
+
+Input routing is display-row aware: Unicode movement advances by UTF-8 scalar
+boundaries, vertical movement preserves a goal display column, and Home/End
+operate on the current wrapped row. Shift variants extend each caret's anchor;
+click, drag, word, line, and multi-caret operations remain core selection
+operations. WGPUI contributes only event translation and presentation.
+
+The showcase intentionally stops at Rust syntax and a single native surface.
+It does not yet provide semantic-token/LSP coloring, a language download
+mechanism, rectangular selection, minimap, or workspace-shell features.
+
 ## Migration inventory
 
 ### Migrate as behavior references

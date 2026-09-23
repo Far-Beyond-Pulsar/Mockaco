@@ -2,7 +2,7 @@ use crate::{DemoAction, DemoState, DEMO_SOURCE};
 use mockaco_core::{Document, Selection, SelectionSet};
 use mockaco_diff::DiffEditor;
 use mockaco_gpui::{native::WgpuiEditorView, EditorSurface, SurfaceGeometry};
-use mockaco_renderer::{Decoration, DisplayConfig, FoldRegion, FoldSet, WrapConfig};
+use mockaco_renderer::{Decoration, DisplayConfig, WrapConfig};
 use wgpui::{
     div, px, rgb, size, App, AppContext, Application, Bounds, Context, Entity, InteractiveElement,
     IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled, Window, WindowBounds,
@@ -111,8 +111,21 @@ impl Showcase {
                     view.surface.redo();
                 }
                 EditorAction::Fold => {
-                    view.surface
-                        .set_folds(FoldSet::new([FoldRegion::new(0, 3).placeholder("…")]));
+                    let line = view
+                        .surface
+                        .editor()
+                        .selections()
+                        .primary()
+                        .and_then(|selection| {
+                            view.surface
+                                .editor()
+                                .document()
+                                .position_map()
+                                .byte_to_line(selection.cursor())
+                                .ok()
+                        })
+                        .unwrap_or(0);
+                    view.surface.toggle_fold_at_line(line);
                 }
             }
             cx.notify();
@@ -225,7 +238,12 @@ impl Render for Showcase {
             .child(self.button(cx, "keep", "Keep local", DemoAction::KeepLocal))
             .child(self.button(cx, "reload", "Reload", DemoAction::ReloadExternal))
             .child(self.button(cx, "close-save", "Close/save", DemoAction::CloseSave))
-            .child(self.button(cx, "close-discard", "Close/discard", DemoAction::CloseDiscard))
+            .child(self.button(
+                cx,
+                "close-discard",
+                "Close/discard",
+                DemoAction::CloseDiscard,
+            ))
             .child(self.button(cx, "close-cancel", "Close/cancel", DemoAction::CloseCancel));
         let editor_actions = div()
             .flex()

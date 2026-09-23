@@ -266,7 +266,10 @@ impl fmt::Debug for LanguageProviderRegistry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LanguageProviderRegistry")
-            .field("highlighters", &self.highlighters.keys().collect::<Vec<_>>())
+            .field(
+                "highlighters",
+                &self.highlighters.keys().collect::<Vec<_>>(),
+            )
             .field("folders", &self.folders.keys().collect::<Vec<_>>())
             .finish()
     }

@@ -1878,8 +1878,8 @@ pub mod native {
             }
             let frame = self.surface.render_frame();
             let geometry = self.surface.geometry();
-            let gutter_width =
-                (frame.gutter.line_number_width as f32 + 1.0) * geometry.gutter_character_width;
+            let gutter_width = self.surface.gutter_width();
+            let code_padding = 12.0;
             let theme = frame.theme;
             let mut root = div()
                 .flex()
@@ -1887,6 +1887,9 @@ pub mod native {
                 .size_full()
                 .bg(color(theme.background))
                 .text_color(color(theme.foreground))
+                .font_family("JetBrains Mono")
+                .text_size(px(14.0))
+                .line_height(px(geometry.line_height))
                 .track_focus(self.focus_handle.as_ref().unwrap())
                 .on_key_down(cx.listener(Self::on_key_down))
                 .on_mouse_down(wgpui::MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -1903,7 +1906,9 @@ pub mod native {
                     .relative()
                     .flex_1()
                     .h(px(row.height))
-                    .pl_2()
+                    .pl(px(code_padding))
+                    .pr(px(code_padding))
+                    .font_family("JetBrains Mono")
                     .bg(color(if row.active {
                         theme.active_line
                     } else {
@@ -1918,7 +1923,7 @@ pub mod native {
                     code = code.child(
                         div()
                             .absolute()
-                            .left(px(selection.x))
+                            .left(px(selection.x + code_padding))
                             .top(px(selection.y - row.y))
                             .w(px(selection.width.max(1.0)))
                             .h(px(selection.height))
@@ -1937,7 +1942,7 @@ pub mod native {
                     code = code.child(
                         div()
                             .absolute()
-                            .left(px(decoration.x))
+                            .left(px(decoration.x + code_padding))
                             .top(px(decoration.y - row.y))
                             .w(px(decoration.width.max(1.0)))
                             .h(px(decoration.height))
@@ -1972,7 +1977,7 @@ pub mod native {
                     code = code.child(
                         div()
                             .absolute()
-                            .left(px(caret.x))
+                            .left(px(caret.x + code_padding))
                             .top(px(caret.y - row.y))
                             .w(px(if caret.primary { 2.0 } else { 1.0 }))
                             .h(px(caret.height))
@@ -1989,36 +1994,58 @@ pub mod native {
                                 .h(px(row.height))
                                 .w(px(gutter_width))
                                 .bg(color(theme.gutter_background))
+                                .font_family("JetBrains Mono")
+                                .text_size(px(13.0))
                                 .border_r_1()
                                 .border_color(color(SurfaceColor::rgba(55, 65, 82, 255)))
-                                .text_color(color(theme.gutter_foreground))
-                                .text_right()
+                                .text_color(color(if row.active {
+                                    theme.foreground
+                                } else {
+                                    theme.gutter_foreground
+                                }))
                                 .whitespace_nowrap()
-                                .pr_2()
                                 .child(
                                     div()
                                         .flex()
                                         .flex_row()
                                         .justify_end()
                                         .child(
-                                            if gutter.map(|gutter| gutter.foldable).unwrap_or(false)
-                                            {
-                                                if gutter
-                                                    .map(|gutter| gutter.folded)
-                                                    .unwrap_or(false)
-                                                {
-                                                    "›"
-                                                } else {
-                                                    "⌄"
-                                                }
-                                            } else {
-                                                " "
-                                            },
+                                            div()
+                                                .w(px(14.0))
+                                                .text_center()
+                                                .text_color(color(SurfaceColor::rgba(
+                                                    125, 151, 184, 255,
+                                                )))
+                                                .child(
+                                                    if gutter
+                                                        .map(|gutter| gutter.foldable)
+                                                        .unwrap_or(false)
+                                                    {
+                                                        if gutter
+                                                            .map(|gutter| gutter.folded)
+                                                            .unwrap_or(false)
+                                                        {
+                                                            "›"
+                                                        } else {
+                                                            "⌄"
+                                                        }
+                                                    } else {
+                                                        " "
+                                                    },
+                                                ),
                                         )
-                                        .child(format!(
-                                            "{}",
-                                            gutter.map(|gutter| gutter.line_number).unwrap_or(0)
-                                        )),
+                                        .child(
+                                            div()
+                                                .w(px(frame.gutter.line_number_width as f32
+                                                    * geometry.gutter_character_width))
+                                                .text_right()
+                                                .child(format!(
+                                                    "{}",
+                                                    gutter
+                                                        .map(|gutter| gutter.line_number)
+                                                        .unwrap_or(0)
+                                                )),
+                                        ),
                                 ),
                         )
                         .child(code),
