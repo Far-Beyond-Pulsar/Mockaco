@@ -28,11 +28,13 @@ host UI toolkit.
                            |
                     mockaco-workspace
                            |
-                      mockaco-gpui
-                    /       |        \
-           mockaco-lsp  mockaco-language  WGPUI-Component
-                    \       |        /        |
-                     mockaco-core           WGPUI
+                    mockaco-gpui
+                  /      |       |       \
+      mockaco-diff  mockaco-lsp  mockaco-language  WGPUI
+             |              |          |
+             +--------------+----------+
+                            |
+                       mockaco-core
 ```
 
 Mockaco may depend on WGPUI-Component. WGPUI-Component must never depend on
@@ -46,6 +48,7 @@ mockaco/
 ├── crates/
 │   ├── mockaco-core/
 │   ├── mockaco-language/
+│   ├── mockaco-diff/
 │   ├── mockaco-lsp/
 │   ├── mockaco-renderer/
 │   ├── mockaco-gpui/
@@ -104,6 +107,20 @@ Asynchronous language-server integration.
 LSP results enter the editor through versioned snapshots and are discarded when
 their document version is stale.
 
+### `mockaco-diff`
+
+The framework-independent split-screen diff model.
+
+- original/read-only and modified/editable document sides
+- deterministic line and hunk alignment
+- side-specific position and selection mapping
+- independent or synchronized scroll policy
+- renderer-neutral diff rows and decorations
+- version-aware background result publication
+
+The diff crate does not load files, save files, own tabs, or manage workspace
+state. The modified side is edited through core transactions only.
+
 ### `mockaco-renderer`
 
 Renderer-neutral layout and display mapping.
@@ -137,7 +154,6 @@ The optional application-level editor shell.
 - file explorer
 - file loading/saving
 - dirty state and external file changes
-- diff editor
 - command routing
 - workspace persistence
 
@@ -297,5 +313,3 @@ Mockaco is ready to replace the current editor when it has a standalone harness,
 document and rendering benchmarks, deterministic editor-core tests, IME coverage,
 large-file coverage, LSP cancellation/version tests, and a Pulsar adapter that
 does not expose Mockaco internals or require Pulsar types in the core crates.
-
-

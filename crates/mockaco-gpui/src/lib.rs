@@ -8,6 +8,10 @@ use mockaco_core::{
     Affinity, DiagnosticSet, DocumentSnapshot, Edit, EditorState, Grouping, SearchSession,
     Selection, SelectionSet, Transaction, TransactionError,
 };
+use mockaco_diff::{
+    DiffEditor, DiffError, DiffPosition, DiffResult, DiffRowKind, DiffScrollMode, DiffScrollState,
+    DiffSide,
+};
 use mockaco_renderer::{
     diagnostic_decorations, search_decorations, Decoration, DisplayMap, DisplayMapError,
     DisplayPoint, DisplayViewport, GutterLayout, ProjectedDecoration,
@@ -352,6 +356,7 @@ impl std::error::Error for InputError {}
 pub enum SurfaceError {
     Transaction(TransactionError),
     Display(DisplayMapError),
+    Diff(DiffError),
     Input(InputError),
     StaleDocumentVersion { expected: u64, actual: u64 },
 }
@@ -361,6 +366,7 @@ impl fmt::Display for SurfaceError {
         match self {
             Self::Transaction(error) => error.fmt(f),
             Self::Display(error) => error.fmt(f),
+            Self::Diff(error) => error.fmt(f),
             Self::Input(error) => error.fmt(f),
             Self::StaleDocumentVersion { expected, actual } => {
                 write!(
@@ -383,6 +389,12 @@ impl From<TransactionError> for SurfaceError {
 impl From<DisplayMapError> for SurfaceError {
     fn from(error: DisplayMapError) -> Self {
         Self::Display(error)
+    }
+}
+
+impl From<DiffError> for SurfaceError {
+    fn from(error: DiffError) -> Self {
+        Self::Diff(error)
     }
 }
 
@@ -736,6 +748,170 @@ impl EditorSurface {
             .unwrap_or(0);
         self.scroll.set_viewport(rows, columns);
         self.scroll.set_content(self.display.row_count(), max_width);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffPaintRow {
+    pub display_row: usize,
+    pub side: DiffSide,
+    pub line: Option<usize>,
+    pub text: Option<String>,
+    pub kind: DiffRowKind,
+    pub hunk: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffRenderFrame {
+    pub original_rows: Vec<DiffPaintRow>,
+    pub modified_rows: Vec<DiffPaintRow>,
+    pub original_visible_rows: Range<usize>,
+    pub modified_visible_rows: Range<usize>,
+    pub modified_document_version: u64,
+    pub invalidation_revision: u64,
+}
+
+/// Framework-neutral presentation state for a split original/modified view.
+///
+/// The original side is never exposed as an editable `EditorState`; all edit
+/// methods route exclusively to the modified side of [`DiffEditor`]. Native
+/// WGPUI code can consume [`DiffRenderFrame`] without owning diff computation.
+#[derive(Debug, Clone)]
+pub struct DiffSplitSurface {
+    editor: DiffEditor,
+    scroll: DiffScrollState,
+    invalidation: InvalidationState,
+}
+
+impl DiffSplitSurface {
+    pub fn new(original: &DocumentSnapshot, modified_text: impl Into<String>) -> Self {
+        let editor = DiffEditor::new(original, modified_text);
+        let scroll =
+            DiffScrollState::new(DiffScrollMode::Synchronized, editor.diff().rows().len(), 0);
+        Self {
+            editor,
+            scroll,
+            invalidation: InvalidationState::default(),
+        }
+    }
+
+    pub fn editor(&self) -> &DiffEditor {
+        &self.editor
+    }
+
+    pub fn diff(&self) -> &DiffResult {
+        self.editor.diff()
+    }
+
+    pub fn scroll(&self) -> DiffScrollState {
+        self.scroll
+    }
+
+    pub fn set_scroll_mode(&mut self, mode: DiffScrollMode) {
+        self.scroll.set_mode(mode);
+        self.invalidation.push(InvalidationKind::Scroll, None);
+    }
+
+    pub fn set_viewport(&mut self, rows: usize) {
+        self.scroll.set_viewport(rows);
+        self.invalidation.push(InvalidationKind::Viewport, None);
+    }
+
+    pub fn scroll_by(&mut self, side: DiffSide, delta: isize) -> bool {
+        let changed = self.scroll.scroll_by(side, delta);
+        if changed {
+            self.invalidation.push(InvalidationKind::Scroll, None);
+        }
+        changed
+    }
+
+    pub fn scroll_to(&mut self, side: DiffSide, row: usize) -> bool {
+        let changed = self.scroll.scroll_to(side, row);
+        if changed {
+            self.invalidation.push(InvalidationKind::Scroll, None);
+        }
+        changed
+    }
+
+    pub fn apply_modified_edit(
+        &mut self,
+        range: Range<usize>,
+        replacement: impl Into<String>,
+    ) -> Result<(), SurfaceError> {
+        self.editor.apply_modified_edit(range, replacement)?;
+        self.scroll.set_content(self.editor.diff().rows().len());
+        self.invalidation.push(InvalidationKind::Document, None);
+        Ok(())
+    }
+
+    pub fn accept_diff(&mut self, result: DiffResult) -> Result<(), SurfaceError> {
+        self.editor.accept_diff(result)?;
+        self.scroll.set_content(self.editor.diff().rows().len());
+        self.invalidation.push(InvalidationKind::Document, None);
+        Ok(())
+    }
+
+    pub fn set_original(&mut self, original: &DocumentSnapshot) {
+        self.editor.set_original(original);
+        self.scroll.set_content(self.editor.diff().rows().len());
+        self.invalidation.push(InvalidationKind::Document, None);
+    }
+
+    pub fn invalidation(&self) -> &InvalidationState {
+        &self.invalidation
+    }
+
+    pub fn take_invalidations(&mut self) -> InvalidationBatch {
+        self.invalidation.take()
+    }
+
+    pub fn render_frame(&self) -> DiffRenderFrame {
+        let original_visible = self.scroll.visible_rows(DiffSide::Original);
+        let modified_visible = self.scroll.visible_rows(DiffSide::Modified);
+        let original_rows = original_visible
+            .clone()
+            .map(|row| paint_diff_row(self.editor.diff(), row, DiffSide::Original))
+            .collect();
+        let modified_rows = modified_visible
+            .clone()
+            .map(|row| paint_diff_row(self.editor.diff(), row, DiffSide::Modified))
+            .collect();
+        DiffRenderFrame {
+            original_rows,
+            modified_rows,
+            original_visible_rows: original_visible,
+            modified_visible_rows: modified_visible,
+            modified_document_version: self.editor.modified().snapshot().version(),
+            invalidation_revision: self.invalidation.revision(),
+        }
+    }
+
+    pub fn map_position(
+        &self,
+        side: DiffSide,
+        position: DiffPosition,
+        target_side: DiffSide,
+    ) -> Result<mockaco_diff::DiffPositionMapping, SurfaceError> {
+        Ok(self
+            .editor
+            .diff()
+            .map_position(side, position, target_side)?)
+    }
+}
+
+fn paint_diff_row(result: &DiffResult, row: usize, side: DiffSide) -> DiffPaintRow {
+    let diff_row = &result.rows()[row];
+    let line = match side {
+        DiffSide::Original => diff_row.original.as_ref(),
+        DiffSide::Modified => diff_row.modified.as_ref(),
+    };
+    DiffPaintRow {
+        display_row: row,
+        side,
+        line: line.map(|line| line.line),
+        text: line.map(|line| line.text.clone()),
+        kind: diff_row.kind,
+        hunk: diff_row.hunk,
     }
 }
 
@@ -1575,5 +1751,36 @@ mod tests {
             surface.editor().selections().selections()[0],
             Selection::range(1, 4)
         );
+    }
+
+    #[test]
+    fn diff_split_surface_presents_both_sides_and_synchronizes_scroll() {
+        let original = mockaco_core::Document::new("same\nold").snapshot();
+        let mut surface = DiffSplitSurface::new(&original, "same\nnew");
+        surface.set_viewport(1);
+        let _frame = surface.render_frame();
+        surface.scroll_to(DiffSide::Original, 1);
+        let frame = surface.render_frame();
+        assert_eq!(frame.original_rows.len(), 1);
+        assert_eq!(frame.modified_rows.len(), 1);
+        assert_eq!(frame.original_rows[0].text.as_deref(), Some("old"));
+        assert_eq!(frame.modified_rows[0].text.as_deref(), Some("new"));
+        assert_eq!(frame.modified_rows[0].kind, DiffRowKind::Replace);
+        assert_eq!(surface.scroll().top_row(DiffSide::Modified), 1);
+    }
+
+    #[test]
+    fn diff_split_surface_edits_only_modified_and_rejects_stale_results() {
+        let original = mockaco_core::Document::new("same").snapshot();
+        let mut surface = DiffSplitSurface::new(&original, "same");
+        let stale = surface.diff().clone();
+        surface.apply_modified_edit(0..4, "changed").unwrap();
+        assert_eq!(surface.editor().original().text(), "same");
+        assert_eq!(surface.editor().modified().document().text(), "changed");
+        assert!(matches!(
+            surface.accept_diff(stale),
+            Err(SurfaceError::Diff(DiffError::StaleResult { .. }))
+        ));
+        assert_eq!(surface.take_invalidations().invalidations.len(), 1);
     }
 }
