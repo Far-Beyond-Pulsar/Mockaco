@@ -158,13 +158,21 @@ impl FoldSet {
     }
 
     pub fn region_starting_at(&self, line: usize) -> Option<&FoldRegion> {
-        self.regions.iter().find(|region| region.start_line == line)
+        let index = self
+            .regions
+            .partition_point(|region| region.start_line < line);
+        self.regions
+            .get(index)
+            .filter(|region| region.start_line == line)
     }
 
     pub fn foldable_starting_at(&self, line: usize) -> Option<&FoldRegion> {
+        let index = self
+            .foldable
+            .partition_point(|region| region.start_line < line);
         self.foldable
-            .iter()
-            .find(|region| region.start_line == line)
+            .get(index)
+            .filter(|region| region.start_line == line)
             .or_else(|| self.region_starting_at(line))
     }
 
@@ -480,22 +488,15 @@ impl DisplayMap {
     /// Replaces foldability only for a line window. Foldability changes do not
     /// alter display rows unless an active fold is changed, so this avoids
     /// rebuilding the document-sized layout when a background parser reports
-    /// syntax for the current viewport.
+    /// syntax for the current viewport. Unseen fold markers are deliberately
+    /// not retained: they are cheap to derive again when that viewport is
+    /// visited and cannot turn scrolling into an ever-growing index update.
     pub fn set_foldable_regions_in_line_range(
         &mut self,
-        line_range: Range<usize>,
+        _line_range: Range<usize>,
         foldable: impl IntoIterator<Item = FoldRegion>,
     ) {
-        let preserved = self
-            .folds
-            .foldable_regions()
-            .iter()
-            .filter(|region| {
-                region.end_line <= line_range.start || region.start_line >= line_range.end
-            })
-            .cloned();
-        self.folds =
-            FoldSet::with_foldable(self.folds.regions().to_vec(), preserved.chain(foldable));
+        self.folds = FoldSet::with_foldable(self.folds.regions().to_vec(), foldable);
         self.revision = self.revision.saturating_add(1);
         self.last_update = None;
     }
@@ -662,13 +663,15 @@ impl DisplayMap {
                 PositionError::InvalidUtf8Boundary(byte),
             ));
         }
-        for (index, row) in self.rows.iter().enumerate() {
+        let mut index = self.rows.partition_point(|row| row.end_byte < byte);
+        while let Some(row) = self.rows.get(index) {
             if byte < row.start_byte || byte > row.end_byte {
-                continue;
+                break;
             }
             if byte == row.end_byte && affinity == Affinity::After {
                 if let Some(next) = self.rows.get(index + 1) {
                     if next.buffer_line == row.buffer_line {
+                        index += 1;
                         continue;
                     }
                 }
@@ -679,10 +682,13 @@ impl DisplayMap {
         }
         let line = self.snapshot.position_map().byte_to_line(byte)?;
         if let Some(fold) = self.folds.hidden_by(line) {
-            if let Some(row) = self
+            let row = self
                 .rows
-                .iter()
-                .position(|row| row.buffer_line == fold.start_line)
+                .partition_point(|row| row.buffer_line < fold.start_line);
+            if self
+                .rows
+                .get(row)
+                .is_some_and(|row| row.buffer_line == fold.start_line)
             {
                 return Ok(DisplayPoint {
                     row,
@@ -745,9 +751,19 @@ impl DisplayMap {
         let mut projected = Vec::new();
         let start = display_range.start.min(self.rows.len());
         let end = display_range.end.min(self.rows.len());
+        if start >= end {
+            return projected;
+        }
+        let byte_start = self.rows[start].start_byte;
+        let byte_end = self.rows[end - 1].end_byte;
+        let first_decoration =
+            decorations.partition_point(|decoration| decoration.range.end <= byte_start);
         for (offset, row) in self.rows[start..end].iter().enumerate() {
             let display_row = start + offset;
-            for decoration in decorations {
+            for decoration in &decorations[first_decoration..] {
+                if decoration.range.start > byte_end {
+                    break;
+                }
                 let start = decoration.range.start.max(row.start_byte);
                 let end = decoration.range.end.min(row.end_byte);
                 let overlaps = start < end

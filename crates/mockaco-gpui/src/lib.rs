@@ -596,6 +596,8 @@ impl EditorSurface {
         let old_rows = self.decoration_rows(&self.decorations);
         let new_rows = self.decoration_rows(&decorations);
         self.decorations = decorations;
+        self.decorations
+            .sort_by_key(|decoration| (decoration.range.start, decoration.range.end));
         self.invalidation.push(
             InvalidationKind::Decoration,
             merge_ranges(old_rows, new_rows),
@@ -1026,16 +1028,24 @@ impl EditorSurface {
     }
 
     fn decoration_rows(&self, decorations: &[Decoration]) -> Option<Range<usize>> {
-        let projected = self.display.project_decorations(decorations);
-        let start = projected
+        let start = decorations
             .iter()
-            .map(|decoration| decoration.display_row)
+            .filter_map(|decoration| {
+                self.display
+                    .buffer_to_display(decoration.range.start, Affinity::Before)
+                    .ok()
+                    .map(|point| point.row)
+            })
             .min()?;
-        let end = projected
+        let end = decorations
             .iter()
-            .map(|decoration| decoration.display_row)
-            .max()?
-            .saturating_add(1);
+            .filter_map(|decoration| {
+                self.display
+                    .buffer_to_display(decoration.range.end, Affinity::After)
+                    .ok()
+                    .map(|point| point.row.saturating_add(1))
+            })
+            .max()?;
         Some(start..end)
     }
 
@@ -2151,7 +2161,7 @@ pub mod native {
                     let vertical = (total / geometry.line_height.max(1.0)).trunc() as isize;
                     self.scroll_remainder = total - vertical as f32 * geometry.line_height.max(1.0);
                     (
-                        -vertical,
+                        vertical,
                         (point.x.as_f32() / geometry.character_width.max(1.0)).round() as isize,
                     )
                 }
@@ -2599,7 +2609,7 @@ pub mod native {
 
         #[test]
         fn scrollbar_thumb_tracks_logical_scroll_and_has_a_minimum_size() {
-            let mut scroll = ScrollState::default();
+            let mut scroll = crate::ScrollState::default();
             scroll.set_viewport(10, 80);
             scroll.set_content_with_bottom_padding(100, 80, 1);
             let top = scrollbar_geometry(scroll, 400.0).expect("scrollbar is visible");
@@ -2944,6 +2954,7 @@ mod tests {
         let frame = surface.render_frame_with_buffer(1);
         assert!(frame.rows.len() <= 22);
         assert_eq!(frame.rows.len(), frame.gutter.rows.len());
+        assert!(frame.rows.iter().any(|row| !row.tokens.is_empty()));
         assert!(surface.highlights.tokens().len() < 1_000);
         assert!(frame.decorations.iter().all(|decoration| frame
             .rows

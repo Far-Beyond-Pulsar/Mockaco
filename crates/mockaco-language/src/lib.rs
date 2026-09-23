@@ -377,7 +377,7 @@ impl fmt::Debug for RustTreeSitterProvider {
 struct RustParserState {
     parser: Parser,
     tree: Option<tree_sitter::Tree>,
-    text: String,
+    parsed_range: Option<Range<usize>>,
     version: Option<u64>,
 }
 
@@ -395,7 +395,7 @@ impl RustTreeSitterProvider {
             state: Mutex::new(RustParserState {
                 parser,
                 tree: None,
-                text: String::new(),
+                parsed_range: None,
                 version: None,
             }),
         })
@@ -409,8 +409,9 @@ impl RustTreeSitterProvider {
     }
 
     /// Incrementally reparses after a core transaction when the previous
-    /// parser state is the transaction's before-version. A full parse is used
-    /// as a safe fallback when a worker receives a snapshot out of order.
+    /// parser state is the transaction's before-version. A bounded included
+    /// range is used as a safe fallback when a worker receives a snapshot out
+    /// of order or the edit falls outside the cached syntax window.
     pub fn apply_transaction(
         &self,
         before: &DocumentSnapshot,
@@ -431,19 +432,29 @@ impl RustTreeSitterProvider {
             .lock()
             .map_err(|_| LanguageError::Provider("parser state lock poisoned".into()))?;
         if let Some(version) = state.version {
-            if version != before.version() || state.text != before.text() {
+            if version != before.version() {
                 return Err(LanguageError::StaleVersion {
                     expected: version,
                     actual: before.version(),
                 });
             }
         }
-        if state.version == Some(before.version()) && state.text == before.text() {
+        let requested_range = syntax_window(after, range.clone());
+        let old_window = state.parsed_range.clone();
+        let can_incrementally_reparse =
+            state.version == Some(before.version())
+                && state.tree.is_some()
+                && old_window.as_ref().is_some_and(|window| {
+                    transaction.change_map.edits().iter().all(|edit| {
+                        window.start <= edit.range.start && edit.range.end <= window.end
+                    })
+                });
+        if can_incrementally_reparse {
             for edit in transaction.change_map.edits().iter().rev() {
                 let new_range = transaction.change_map.map_range(edit.range.clone());
-                let old_start = point_at(before.text(), edit.range.start);
-                let old_end = point_at(before.text(), edit.range.end);
-                let new_end = point_at(after.text(), new_range.end);
+                let old_start = point_at(before, edit.range.start);
+                let old_end = point_at(before, edit.range.end);
+                let new_end = point_at(after, new_range.end);
                 if let Some(tree) = state.tree.as_mut() {
                     tree.edit(&InputEdit {
                         start_byte: edit.range.start,
@@ -455,12 +466,25 @@ impl RustTreeSitterProvider {
                     });
                 }
             }
+            let mapped_window = transaction
+                .change_map
+                .map_range(old_window.expect("incremental parser window"));
+            state
+                .parser
+                .set_included_ranges(&[tree_sitter_range(after, mapped_window.clone())])
+                .map_err(|error| LanguageError::Provider(error.to_string()))?;
+            let old_tree = state.tree.take();
+            state.tree = state.parser.parse(after.text(), old_tree.as_ref());
+            state.parsed_range = Some(mapped_window);
         } else {
+            state
+                .parser
+                .set_included_ranges(&[tree_sitter_range(after, requested_range.clone())])
+                .map_err(|error| LanguageError::Provider(error.to_string()))?;
             state.tree = None;
+            state.tree = state.parser.parse(after.text(), None);
+            state.parsed_range = Some(requested_range.clone());
         }
-        let old_tree = state.tree.take();
-        state.tree = state.parser.parse(after.text(), old_tree.as_ref());
-        state.text = after.text().to_owned();
         state.version = Some(after.version());
         let tree = state
             .tree
@@ -478,10 +502,19 @@ impl RustTreeSitterProvider {
             .state
             .lock()
             .map_err(|_| LanguageError::Provider("parser state lock poisoned".into()))?;
-        if state.version != Some(snapshot.version()) || state.text != snapshot.text() {
+        let requested_range = syntax_window(snapshot, range.clone());
+        if state.version != Some(snapshot.version())
+            || !state.parsed_range.as_ref().is_some_and(|parsed| {
+                parsed.start <= requested_range.start && parsed.end >= requested_range.end
+            })
+        {
+            state
+                .parser
+                .set_included_ranges(&[tree_sitter_range(snapshot, requested_range.clone())])
+                .map_err(|error| LanguageError::Provider(error.to_string()))?;
             state.tree = None;
             state.tree = state.parser.parse(snapshot.text(), None);
-            state.text = snapshot.text().to_owned();
+            state.parsed_range = Some(requested_range);
             state.version = Some(snapshot.version());
         }
         let tree = state
@@ -540,10 +573,19 @@ impl SyntaxHighlightProvider for RustTreeSitterProvider {
             .state
             .lock()
             .map_err(|_| LanguageError::Provider("parser state lock poisoned".into()))?;
-        if state.version != Some(snapshot.version()) || state.text != snapshot.text() {
+        let requested_range = syntax_window(snapshot, range.clone());
+        if state.version != Some(snapshot.version())
+            || !state.parsed_range.as_ref().is_some_and(|parsed| {
+                parsed.start <= requested_range.start && parsed.end >= requested_range.end
+            })
+        {
+            state
+                .parser
+                .set_included_ranges(&[tree_sitter_range(snapshot, requested_range.clone())])
+                .map_err(|error| LanguageError::Provider(error.to_string()))?;
             state.tree = None;
             state.tree = state.parser.parse(snapshot.text(), None);
-            state.text = snapshot.text().to_owned();
+            state.parsed_range = Some(requested_range);
             state.version = Some(snapshot.version());
         }
         let tree = state
@@ -583,12 +625,53 @@ fn clamp_range(text: &str, range: Range<usize>) -> Range<usize> {
     start..end
 }
 
-fn point_at(text: &str, byte: usize) -> Point {
-    let byte = byte.min(text.len());
-    let prefix = &text[..byte.min(text.len())];
-    let row = prefix.bytes().filter(|byte| *byte == b'\n').count();
-    let column = prefix.rsplit('\n').next().map_or(0, str::len);
-    Point { row, column }
+/// Expands a requested paint range by one line on either side. Tree-sitter is
+/// still used for real syntax, but the parser is restricted to this bounded
+/// window so a viewport change never reparses the entire document.
+fn syntax_window(snapshot: &DocumentSnapshot, range: Range<usize>) -> Range<usize> {
+    let range = clamp_range(snapshot.text(), range);
+    if snapshot.len_bytes() == 0 {
+        return 0..0;
+    }
+    let position_map = snapshot.position_map();
+    let first_line = position_map
+        .byte_to_line(range.start)
+        .unwrap_or(0)
+        .saturating_sub(1);
+    let last_line = position_map
+        .byte_to_line(range.end)
+        .unwrap_or(first_line)
+        .saturating_add(1)
+        .min(position_map.line_count().saturating_sub(1));
+    let start = position_map.line_start(first_line).unwrap_or(0);
+    let end = if last_line + 1 < position_map.line_count() {
+        position_map
+            .line_start(last_line + 1)
+            .unwrap_or(snapshot.len_bytes())
+    } else {
+        snapshot.len_bytes()
+    };
+    start..end
+}
+
+fn tree_sitter_range(snapshot: &DocumentSnapshot, range: Range<usize>) -> tree_sitter::Range {
+    tree_sitter::Range {
+        start_byte: range.start,
+        end_byte: range.end,
+        start_point: point_at(snapshot, range.start),
+        end_point: point_at(snapshot, range.end),
+    }
+}
+
+fn point_at(snapshot: &DocumentSnapshot, byte: usize) -> Point {
+    let byte = byte.min(snapshot.len_bytes());
+    let position_map = snapshot.position_map();
+    let row = position_map.byte_to_line(byte).unwrap_or(0);
+    let line_start = position_map.line_start(row).unwrap_or(0);
+    Point {
+        row,
+        column: byte.saturating_sub(line_start),
+    }
 }
 
 fn collect_folds(node: tree_sitter::Node<'_>, range: &Range<usize>, folds: &mut Vec<FoldRange>) {
@@ -970,6 +1053,30 @@ mod tests {
             .iter()
             .all(|token| document.text().is_char_boundary(token.range.start)
                 && document.text().is_char_boundary(token.range.end)));
+    }
+
+    #[test]
+    fn rust_tree_sitter_restricts_non_full_requests_to_a_context_window() {
+        let provider = RustTreeSitterProvider::new().unwrap();
+        let text = (0..200)
+            .map(|line| format!("fn item_{line}() {{ let value = {line}; }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let document = Document::new(text);
+        let snapshot = document.snapshot();
+        let position_map = snapshot.position_map();
+        let requested = position_map.line_start(100).unwrap()..position_map.line_end(100).unwrap();
+        let result = provider.highlight(&snapshot, requested.clone()).unwrap();
+        let state = provider.state.lock().unwrap();
+        let parsed = state.parsed_range.as_ref().unwrap();
+
+        assert!(parsed.start < requested.start);
+        assert!(parsed.end > requested.end);
+        assert!(parsed.end - parsed.start < snapshot.len_bytes() / 4);
+        assert!(result
+            .tokens
+            .iter()
+            .all(|token| token.range.start < requested.end && token.range.end > requested.start));
     }
 
     #[test]
