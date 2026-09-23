@@ -12,6 +12,10 @@ use mockaco_diff::{
     DiffEditor, DiffError, DiffPosition, DiffResult, DiffRowKind, DiffScrollMode, DiffScrollState,
     DiffSide,
 };
+use mockaco_language::{
+    FoldingProvider, FontStyle, IncrementalHighlights, Rgba, RustTreeSitterProvider,
+    SyntaxHighlightProvider, Theme, TokenKind, TokenStyle,
+};
 use mockaco_renderer::{
     diagnostic_decorations, search_decorations, Decoration, DisplayMap, DisplayMapError,
     DisplayPoint, DisplayViewport, GutterLayout, ProjectedDecoration,
@@ -174,7 +178,7 @@ impl SurfaceColor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceTheme {
     pub background: SurfaceColor,
     pub gutter_background: SurfaceColor,
@@ -184,6 +188,8 @@ pub struct SurfaceTheme {
     pub primary_selection: SurfaceColor,
     pub caret: SurfaceColor,
     pub decoration: SurfaceColor,
+    pub active_line: SurfaceColor,
+    pub syntax: Theme,
 }
 
 impl Default for SurfaceTheme {
@@ -197,8 +203,44 @@ impl Default for SurfaceTheme {
             primary_selection: SurfaceColor::rgba(70, 115, 180, 210),
             caret: SurfaceColor::rgba(235, 235, 235, 255),
             decoration: SurfaceColor::rgba(220, 170, 70, 190),
+            active_line: SurfaceColor::rgba(36, 44, 58, 150),
+            syntax: syntax_theme(),
         }
     }
+}
+
+fn syntax_theme() -> Theme {
+    let mut theme = Theme::default();
+    let style = |red, green, blue| TokenStyle {
+        foreground: Rgba::rgb(red, green, blue),
+        background: None,
+        font: FontStyle::default(),
+    };
+    for kind in ["keyword", "keyword.operator"] {
+        theme.set_token_style(kind, style(198, 120, 221));
+    }
+    for kind in ["function", "function.method", "function.macro"] {
+        theme.set_token_style(kind, style(97, 175, 239));
+    }
+    for kind in ["type", "type.builtin", "constructor"] {
+        theme.set_token_style(kind, style(229, 192, 123));
+    }
+    for kind in ["string", "character", "escape"] {
+        theme.set_token_style(kind, style(152, 195, 121));
+    }
+    for kind in ["comment", "comment.documentation"] {
+        theme.set_token_style(kind, style(92, 160, 102));
+    }
+    for kind in ["constant", "constant.builtin", "number"] {
+        theme.set_token_style(kind, style(209, 154, 102));
+    }
+    for kind in ["attribute", "property", "variable.parameter"] {
+        theme.set_token_style(kind, style(86, 182, 194));
+    }
+    for kind in ["operator", "punctuation.bracket", "punctuation.delimiter"] {
+        theme.set_token_style(kind, style(171, 178, 191));
+    }
+    theme
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -212,6 +254,15 @@ pub struct PaintRow {
     pub continuation: bool,
     pub folded: bool,
     pub truncated: bool,
+    pub active: bool,
+    pub tokens: Vec<PaintToken>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaintToken {
+    pub range: Range<usize>,
+    pub kind: TokenKind,
+    pub style: Option<TokenStyle>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -269,9 +320,21 @@ pub enum MouseButton {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MouseEvent {
-    Down { x: f32, y: f32, button: MouseButton },
-    Drag { x: f32, y: f32 },
-    Up { x: f32, y: f32, button: MouseButton },
+    Down {
+        x: f32,
+        y: f32,
+        button: MouseButton,
+        click_count: usize,
+    },
+    Drag {
+        x: f32,
+        y: f32,
+    },
+    Up {
+        x: f32,
+        y: f32,
+        button: MouseButton,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -292,6 +355,10 @@ pub enum Key {
     Escape,
     Left,
     Right,
+    Up,
+    Down,
+    PageUp,
+    PageDown,
     Home,
     End,
     Unsupported(String),
@@ -326,8 +393,14 @@ pub enum EditCommand {
     DeleteForward,
     MoveLeft { extend: bool },
     MoveRight { extend: bool },
+    MoveUp { extend: bool },
+    MoveDown { extend: bool },
+    MovePageUp { extend: bool },
+    MovePageDown { extend: bool },
     MoveHome { extend: bool },
     MoveEnd { extend: bool },
+    ToggleFold,
+    UnfoldAll,
     Newline,
     Tab,
     CancelComposition,
@@ -420,10 +493,12 @@ impl InputOutcome {
 }
 
 /// Framework-independent editor presentation state.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct EditorSurface {
     editor: EditorState,
     display: DisplayMap,
+    highlighter: RustTreeSitterProvider,
+    highlights: IncrementalHighlights,
     scroll: ScrollState,
     geometry: SurfaceGeometry,
     theme: SurfaceTheme,
@@ -438,10 +513,24 @@ impl EditorSurface {
         geometry: SurfaceGeometry,
     ) -> Self {
         let editor = EditorState::new(text);
-        let display = DisplayMap::new(&editor.snapshot(), display_config);
+        let snapshot = editor.snapshot();
+        let highlighter = RustTreeSitterProvider::new().expect("Rust Tree-sitter provider loads");
+        let highlights = highlighter
+            .highlight(&snapshot, 0..snapshot.len_bytes())
+            .map(IncrementalHighlights::from_result)
+            .unwrap_or_default();
+        let mut display = DisplayMap::new(&snapshot, display_config);
+        if let Ok(folds) = highlighter.fold_ranges(&snapshot, 0..snapshot.len_bytes()) {
+            display.set_foldable_regions(folds.into_iter().map(|fold| {
+                mockaco_renderer::FoldRegion::new(fold.start_line, fold.end_line)
+                    .placeholder(fold.placeholder)
+            }));
+        }
         let mut surface = Self {
             editor,
             display,
+            highlighter,
+            highlights,
             scroll: ScrollState::default(),
             geometry,
             theme: SurfaceTheme::default(),
@@ -477,7 +566,7 @@ impl EditorSurface {
     }
 
     pub fn theme(&self) -> SurfaceTheme {
-        self.theme
+        self.theme.clone()
     }
 
     pub fn set_theme(&mut self, theme: SurfaceTheme) {
@@ -505,8 +594,10 @@ impl EditorSurface {
     /// flows while preserving the current display configuration.
     pub fn replace_text(&mut self, text: impl Into<String>) {
         self.editor = EditorState::new(text);
+        let snapshot = self.editor.snapshot();
         let config = self.display.config().clone();
-        self.display = DisplayMap::new(&self.editor.snapshot(), config);
+        self.display = DisplayMap::new(&snapshot, config);
+        self.refresh_language_state(&snapshot);
         self.recompute_scroll_viewport();
         self.invalidation.push(InvalidationKind::Document, None);
     }
@@ -533,6 +624,91 @@ impl EditorSurface {
         self.display.set_folds(folds);
         self.recompute_scroll_viewport();
         self.invalidation.push(InvalidationKind::Geometry, None);
+    }
+
+    pub fn set_foldable_regions(
+        &mut self,
+        folds: impl IntoIterator<Item = mockaco_renderer::FoldRegion>,
+    ) {
+        self.display.set_foldable_regions(folds);
+        self.recompute_scroll_viewport();
+        self.invalidation.push(InvalidationKind::Geometry, None);
+    }
+
+    pub fn toggle_fold_at_line(&mut self, line: usize) -> bool {
+        let Some(region) = self.display.folds().foldable_starting_at(line).cloned() else {
+            return false;
+        };
+        let mut active = self.display.folds().regions().to_vec();
+        if let Some(index) = active.iter().position(|fold| fold.start_line == line) {
+            active.remove(index);
+        } else {
+            active.push(region);
+        }
+        self.display
+            .set_folds(mockaco_renderer::FoldSet::with_foldable(
+                active,
+                self.display.folds().foldable_regions().to_vec(),
+            ));
+        self.recompute_scroll_viewport();
+        self.invalidation.push(InvalidationKind::Geometry, None);
+        true
+    }
+
+    pub fn unfold_all(&mut self) {
+        let foldable = self.display.folds().foldable_regions().to_vec();
+        self.display
+            .set_folds(mockaco_renderer::FoldSet::with_foldable([], foldable));
+        self.recompute_scroll_viewport();
+        self.invalidation.push(InvalidationKind::Geometry, None);
+    }
+
+    pub fn gutter_width(&self) -> f32 {
+        (self.display.gutter(4).line_number_width as f32 + 3.0)
+            * self.geometry.gutter_character_width
+    }
+
+    pub fn select_word_at(&mut self, byte: usize) -> bool {
+        let text = self.editor.document().text();
+        if byte > text.len() || !text.is_char_boundary(byte) {
+            return false;
+        }
+        let is_word = |character: char| character.is_alphanumeric() || character == '_';
+        let start = text[..byte]
+            .char_indices()
+            .rev()
+            .take_while(|(_, character)| is_word(*character))
+            .last()
+            .map_or(byte, |(offset, _)| offset);
+        let end = text[byte..]
+            .char_indices()
+            .take_while(|(_, character)| is_word(*character))
+            .last()
+            .map_or(byte, |(offset, character)| {
+                byte + offset + character.len_utf8()
+            });
+        let range = if start == end { byte..byte } else { start..end };
+        self.editor
+            .set_selections(SelectionSet::new([Selection::range(
+                range.start,
+                range.end,
+            )]));
+        self.invalidation.push(InvalidationKind::Selection, None);
+        start != end
+    }
+
+    pub fn select_line_at(&mut self, line: usize) -> bool {
+        let map = self.editor.document().position_map();
+        let Ok(start) = map.line_start(line) else {
+            return false;
+        };
+        let Ok(end) = map.line_end(line) else {
+            return false;
+        };
+        self.editor
+            .set_selections(SelectionSet::new([Selection::range(start, end)]));
+        self.invalidation.push(InvalidationKind::Selection, None);
+        true
     }
 
     pub fn set_search_and_diagnostic_decorations(
@@ -584,11 +760,26 @@ impl EditorSurface {
         transaction: &Transaction,
         grouping: Grouping,
     ) -> Result<mockaco_core::AppliedTransaction, SurfaceError> {
+        let before_snapshot = self.editor.snapshot();
         let applied = self.editor.apply_with_result(transaction, grouping)?;
         let snapshot = self.editor.snapshot();
         let mut display = self.display.clone();
         let update = display.update(&snapshot, &applied)?;
         self.display = display;
+        if let Ok(result) = self.highlighter.apply_transaction(
+            &before_snapshot,
+            &snapshot,
+            &applied,
+            0..snapshot.len_bytes(),
+        ) {
+            let _ = self.highlights.accept(result);
+        } else if let Ok(result) = self
+            .highlighter
+            .highlight(&snapshot, 0..snapshot.len_bytes())
+        {
+            let _ = self.highlights.accept(result);
+        }
+        self.refresh_language_state(&snapshot);
         self.recompute_scroll_viewport();
         self.invalidation
             .push(InvalidationKind::Document, Some(update.new_range));
@@ -603,6 +794,7 @@ impl EditorSurface {
         let mut display = self.display.clone();
         let update = display.update(&snapshot, &applied)?;
         self.display = display;
+        self.refresh_language_state(&snapshot);
         self.recompute_scroll_viewport();
         self.invalidation
             .push(InvalidationKind::Composition, Some(update.new_range));
@@ -630,6 +822,7 @@ impl EditorSurface {
         let mut display = self.display.clone();
         let update = display.update(snapshot, transaction)?;
         self.display = display;
+        self.refresh_language_state(snapshot);
         self.recompute_scroll_viewport();
         self.invalidation
             .push(InvalidationKind::Document, Some(update.new_range));
@@ -653,6 +846,26 @@ impl EditorSurface {
                     continuation: row.continuation,
                     folded: row.folded,
                     truncated: row.truncated,
+                    active: self.editor.selections().primary().and_then(|selection| {
+                        self.display
+                            .snapshot()
+                            .position_map()
+                            .byte_to_line(selection.cursor())
+                            .ok()
+                    }) == Some(row.buffer_line),
+                    tokens: self
+                        .highlights
+                        .tokens()
+                        .iter()
+                        .filter(|token| {
+                            token.range.start < row.end_byte && token.range.end > row.start_byte
+                        })
+                        .map(|token| PaintToken {
+                            range: token.range.clone(),
+                            kind: token.kind.clone(),
+                            style: self.theme.syntax.style_for(&token.kind),
+                        })
+                        .collect(),
                 }
             })
             .collect::<Vec<_>>();
@@ -689,7 +902,7 @@ impl EditorSurface {
             carets,
             decorations,
             decoration_geometry,
-            theme: self.theme,
+            theme: self.theme.clone(),
             invalidation_revision: self.invalidation.revision(),
         }
     }
@@ -785,11 +998,32 @@ impl EditorSurface {
     }
 
     fn rebuild_display_after_history_change(&mut self) {
+        let snapshot = self.editor.snapshot();
         let config = self.display.config().clone();
         let folds = self.display.folds().clone();
-        self.display = DisplayMap::with_folds(&self.editor.snapshot(), config, folds);
+        self.display = DisplayMap::with_folds(&snapshot, config, folds);
+        self.refresh_language_state(&snapshot);
         self.recompute_scroll_viewport();
         self.invalidation.push(InvalidationKind::Document, None);
+    }
+
+    fn refresh_language_state(&mut self, snapshot: &DocumentSnapshot) {
+        if let Ok(result) = self
+            .highlighter
+            .highlight(snapshot, 0..snapshot.len_bytes())
+        {
+            let _ = self.highlights.accept(result);
+        }
+        if let Ok(folds) = self
+            .highlighter
+            .fold_ranges(snapshot, 0..snapshot.len_bytes())
+        {
+            self.display
+                .set_foldable_regions(folds.into_iter().map(|fold| {
+                    mockaco_renderer::FoldRegion::new(fold.start_line, fold.end_line)
+                        .placeholder(fold.placeholder)
+                }));
+        }
     }
 }
 
@@ -968,12 +1202,19 @@ fn merge_ranges(left: Option<Range<usize>>, right: Option<Range<usize>>) -> Opti
 #[derive(Debug, Clone, Default)]
 pub struct InputRouter {
     drag_anchor: Option<usize>,
+    goal_column: Option<usize>,
 }
 
 impl InputRouter {
     pub fn translate_key(event: &KeyEvent) -> Result<Option<EditCommand>, InputError> {
         let extend = event.modifiers.shift;
         let command = match &event.key {
+            Key::Character(text) if event.modifiers.control && text == "[" => {
+                Some(EditCommand::ToggleFold)
+            }
+            Key::Character(text) if event.modifiers.control && text == "]" => {
+                Some(EditCommand::UnfoldAll)
+            }
             Key::Character(text) if !event.modifiers.control && !event.modifiers.command => {
                 Some(EditCommand::InsertText(text.clone()))
             }
@@ -984,6 +1225,10 @@ impl InputRouter {
             Key::Escape => Some(EditCommand::CancelComposition),
             Key::Left => Some(EditCommand::MoveLeft { extend }),
             Key::Right => Some(EditCommand::MoveRight { extend }),
+            Key::Up => Some(EditCommand::MoveUp { extend }),
+            Key::Down => Some(EditCommand::MoveDown { extend }),
+            Key::PageUp => Some(EditCommand::MovePageUp { extend }),
+            Key::PageDown => Some(EditCommand::MovePageDown { extend }),
             Key::Home => Some(EditCommand::MoveHome { extend }),
             Key::End => Some(EditCommand::MoveEnd { extend }),
             Key::Character(_) => None,
@@ -1031,8 +1276,40 @@ impl InputRouter {
             EditCommand::DeleteForward => self.delete(surface, false),
             EditCommand::MoveLeft { extend } => self.move_horizontal(surface, false, extend),
             EditCommand::MoveRight { extend } => self.move_horizontal(surface, true, extend),
+            EditCommand::MoveUp { extend } => self.move_vertical(surface, -1, extend),
+            EditCommand::MoveDown { extend } => self.move_vertical(surface, 1, extend),
+            EditCommand::MovePageUp { extend } => self.move_vertical(
+                surface,
+                -(surface.scroll.viewport_rows as isize).max(1),
+                extend,
+            ),
+            EditCommand::MovePageDown { extend } => self.move_vertical(
+                surface,
+                (surface.scroll.viewport_rows as isize).max(1),
+                extend,
+            ),
             EditCommand::MoveHome { extend } => self.move_line_edge(surface, false, extend),
             EditCommand::MoveEnd { extend } => self.move_line_edge(surface, true, extend),
+            EditCommand::ToggleFold => {
+                let line = surface.editor.selections().primary().and_then(|selection| {
+                    surface
+                        .editor
+                        .document()
+                        .position_map()
+                        .byte_to_line(selection.cursor())
+                        .ok()
+                });
+                let changed = line.is_some_and(|line| surface.toggle_fold_at_line(line));
+                Ok(InputOutcome {
+                    handled: true,
+                    selection_changed: changed,
+                    ..InputOutcome::handled()
+                })
+            }
+            EditCommand::UnfoldAll => {
+                surface.unfold_all();
+                Ok(InputOutcome::handled())
+            }
             EditCommand::CancelComposition => {
                 let mut outcome = InputOutcome::handled();
                 outcome.composition_changed = surface.editor.cancel_composition();
@@ -1133,7 +1410,15 @@ impl InputRouter {
             .selections()
             .iter()
             .map(|selection| {
-                let cursor = selection.head;
+                let cursor = if !extend && !selection.is_caret() {
+                    if right {
+                        selection.ordered_range().end
+                    } else {
+                        selection.ordered_range().start
+                    }
+                } else {
+                    selection.head
+                };
                 let target = if right {
                     text[cursor..]
                         .chars()
@@ -1154,6 +1439,7 @@ impl InputRouter {
                 }
             });
         surface.editor.set_selections(SelectionSet::new(next));
+        self.goal_column = None;
         surface.invalidation.push(InvalidationKind::Selection, None);
         Ok(InputOutcome {
             handled: true,
@@ -1161,6 +1447,54 @@ impl InputRouter {
             selection_changed: true,
             composition_changed: false,
             scroll_changed: false,
+        })
+    }
+
+    fn move_vertical(
+        &mut self,
+        surface: &mut EditorSurface,
+        delta: isize,
+        extend: bool,
+    ) -> Result<InputOutcome, SurfaceError> {
+        let mut goal = self.goal_column;
+        let selections = surface.editor.selections().clone();
+        let mut moved = Vec::new();
+        for selection in selections.selections() {
+            let point = surface
+                .display
+                .buffer_to_display(selection.head, Affinity::After)
+                .unwrap_or(DisplayPoint { row: 0, column: 0 });
+            let desired = goal.get_or_insert(point.column);
+            let row = if delta.is_negative() {
+                point.row.saturating_sub(delta.unsigned_abs())
+            } else {
+                point.row.saturating_add(delta as usize)
+            }
+            .min(surface.display.row_count().saturating_sub(1));
+            let target = surface
+                .display
+                .display_to_buffer(
+                    DisplayPoint {
+                        row,
+                        column: *desired,
+                    },
+                    Affinity::After,
+                )
+                .map(|point| point.byte_offset)
+                .unwrap_or(selection.head);
+            moved.push(if extend {
+                Selection::range(selection.anchor, target)
+            } else {
+                Selection::caret(target)
+            });
+        }
+        self.goal_column = goal;
+        surface.editor.set_selections(SelectionSet::new(moved));
+        surface.invalidation.push(InvalidationKind::Selection, None);
+        Ok(InputOutcome {
+            handled: true,
+            selection_changed: true,
+            ..InputOutcome::handled()
         })
     }
 
@@ -1177,12 +1511,32 @@ impl InputRouter {
             .selections()
             .iter()
             .map(|selection| {
-                let line = position_map.byte_to_line(selection.head).unwrap_or(0);
-                let target = if end {
-                    position_map.line_end(line).unwrap_or(selection.head)
-                } else {
-                    position_map.line_start(line).unwrap_or(selection.head)
-                };
+                let target = surface
+                    .display
+                    .buffer_to_display(selection.head, Affinity::After)
+                    .ok()
+                    .and_then(|point| {
+                        let row = &surface.display.rows()[point.row];
+                        surface
+                            .display
+                            .display_to_buffer(
+                                DisplayPoint {
+                                    row: point.row,
+                                    column: if end { row.display_width } else { 0 },
+                                },
+                                Affinity::After,
+                            )
+                            .ok()
+                            .map(|mapped| mapped.byte_offset)
+                    })
+                    .unwrap_or_else(|| {
+                        let line = position_map.byte_to_line(selection.head).unwrap_or(0);
+                        if end {
+                            position_map.line_end(line).unwrap_or(selection.head)
+                        } else {
+                            position_map.line_start(line).unwrap_or(selection.head)
+                        }
+                    });
                 if extend {
                     Selection::range(selection.anchor, target)
                 } else {
@@ -1190,6 +1544,7 @@ impl InputRouter {
                 }
             });
         surface.editor.set_selections(SelectionSet::new(next));
+        self.goal_column = None;
         surface.invalidation.push(InvalidationKind::Selection, None);
         Ok(InputOutcome {
             handled: true,
@@ -1254,8 +1609,41 @@ impl InputRouter {
                 x,
                 y,
                 button: MouseButton::Primary,
+                click_count,
             } => {
+                let row = surface
+                    .scroll
+                    .top_row
+                    .saturating_add((y / surface.geometry.line_height).floor() as usize);
+                if x < surface.gutter_width() {
+                    if let Some(gutter) = surface
+                        .display
+                        .gutter(4)
+                        .rows
+                        .iter()
+                        .find(|gutter| gutter.display_row == row)
+                    {
+                        surface.toggle_fold_at_line(gutter.buffer_line);
+                    }
+                    return Ok(InputOutcome::handled());
+                }
                 let byte = mouse_to_byte(surface, x, y)?;
+                if click_count >= 3 {
+                    let line = surface
+                        .editor
+                        .document()
+                        .position_map()
+                        .byte_to_line(byte)
+                        .unwrap_or(0);
+                    surface.select_line_at(line);
+                    self.drag_anchor = None;
+                    return Ok(InputOutcome::handled());
+                }
+                if click_count == 2 {
+                    surface.select_word_at(byte);
+                    self.drag_anchor = None;
+                    return Ok(InputOutcome::handled());
+                }
                 self.drag_anchor = Some(byte);
                 surface.editor.set_selections(SelectionSet::caret(byte));
                 surface.invalidation.push(InvalidationKind::Selection, None);
@@ -1295,7 +1683,8 @@ fn mouse_to_byte(surface: &EditorSurface, x: f32, y: f32) -> Result<usize, Surfa
         .scroll
         .top_row
         .saturating_add((y / surface.geometry.line_height).floor() as usize);
-    let column = (x / surface.geometry.character_width.max(1.0)).floor() as usize;
+    let code_x = (x - surface.gutter_width()).max(0.0);
+    let column = (code_x / surface.geometry.character_width.max(1.0)).floor() as usize;
     surface
         .display
         .display_to_buffer(DisplayPoint { row, column }, Affinity::Before)
@@ -1314,8 +1703,8 @@ pub mod native {
         DIAGNOSTIC_WARNING_STYLE_ID, SEARCH_CURRENT_MATCH_STYLE_ID, SEARCH_MATCH_STYLE_ID,
     };
     use wgpui::{
-        div, px, Context, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
-        ScrollDelta, ScrollWheelEvent, Styled, Window,
+        div, px, Context, FocusHandle, HighlightStyle, InteractiveElement, IntoElement,
+        ParentElement, Render, ScrollDelta, ScrollWheelEvent, Styled, StyledText, Window,
     };
 
     /// Native WGPUI editor view backed by the framework-independent surface.
@@ -1384,6 +1773,10 @@ pub mod native {
                 "escape" => Key::Escape,
                 "left" => Key::Left,
                 "right" => Key::Right,
+                "up" => Key::Up,
+                "down" => Key::Down,
+                "pageup" => Key::PageUp,
+                "pagedown" => Key::PageDown,
                 "home" => Key::Home,
                 "end" => Key::End,
                 _ => keystroke
@@ -1410,6 +1803,7 @@ pub mod native {
                         x: event.position.x.as_f32(),
                         y: event.position.y.as_f32(),
                         button: MouseButton::Primary,
+                        click_count: event.click_count,
                     }),
                     cx,
                 );
@@ -1509,6 +1903,12 @@ pub mod native {
                     .relative()
                     .flex_1()
                     .h(px(row.height))
+                    .pl_2()
+                    .bg(color(if row.active {
+                        theme.active_line
+                    } else {
+                        theme.background
+                    }))
                     .whitespace_nowrap();
                 for selection in frame
                     .selections
@@ -1542,10 +1942,28 @@ pub mod native {
                             .w(px(decoration.width.max(1.0)))
                             .h(px(decoration.height))
                             .border_b_1()
-                            .border_color(color(decoration_color(theme, decoration.style.id))),
+                            .border_color(color(decoration_color(&theme, decoration.style.id))),
                     );
                 }
-                code = code.child(row.text.clone());
+                let highlights = row.tokens.iter().filter_map(|token| {
+                    let start = token.range.start.max(row.source_range.start);
+                    let end = token.range.end.min(row.source_range.end);
+                    token.style.map(|style| {
+                        (
+                            start - row.source_range.start..end - row.source_range.start,
+                            HighlightStyle {
+                                color: Some(color(SurfaceColor::rgba(
+                                    style.foreground.red,
+                                    style.foreground.green,
+                                    style.foreground.blue,
+                                    style.foreground.alpha,
+                                ))),
+                                ..HighlightStyle::default()
+                            },
+                        )
+                    })
+                });
+                code = code.child(StyledText::new(row.text.clone()).with_highlights(highlights));
                 for caret in frame
                     .carets
                     .iter()
@@ -1571,13 +1989,37 @@ pub mod native {
                                 .h(px(row.height))
                                 .w(px(gutter_width))
                                 .bg(color(theme.gutter_background))
+                                .border_r_1()
+                                .border_color(color(SurfaceColor::rgba(55, 65, 82, 255)))
                                 .text_color(color(theme.gutter_foreground))
                                 .text_right()
                                 .whitespace_nowrap()
-                                .child(format!(
-                                    "{}",
-                                    gutter.map(|gutter| gutter.line_number).unwrap_or(0)
-                                )),
+                                .pr_2()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .justify_end()
+                                        .child(
+                                            if gutter.map(|gutter| gutter.foldable).unwrap_or(false)
+                                            {
+                                                if gutter
+                                                    .map(|gutter| gutter.folded)
+                                                    .unwrap_or(false)
+                                                {
+                                                    "›"
+                                                } else {
+                                                    "⌄"
+                                                }
+                                            } else {
+                                                " "
+                                            },
+                                        )
+                                        .child(format!(
+                                            "{}",
+                                            gutter.map(|gutter| gutter.line_number).unwrap_or(0)
+                                        )),
+                                ),
                         )
                         .child(code),
                 );
@@ -1596,7 +2038,7 @@ pub mod native {
         .into()
     }
 
-    fn decoration_color(theme: super::SurfaceTheme, style_id: u32) -> SurfaceColor {
+    fn decoration_color(theme: &super::SurfaceTheme, style_id: u32) -> SurfaceColor {
         match style_id {
             SEARCH_MATCH_STYLE_ID => theme.selection,
             SEARCH_CURRENT_MATCH_STYLE_ID => theme.primary_selection,
@@ -1739,6 +2181,95 @@ mod tests {
     }
 
     #[test]
+    fn navigation_handles_all_directions_and_preserves_vertical_goal() {
+        let mut surface = EditorSurface::new(
+            "abcdef\nab\nabcdef\n",
+            DisplayConfig::unwrapped(),
+            SurfaceGeometry::default(),
+        );
+        surface.editor_mut().set_selections(SelectionSet::caret(5));
+        let mut router = InputRouter::default();
+        for key in [
+            Key::Down,
+            Key::Down,
+            Key::Up,
+            Key::Up,
+            Key::Left,
+            Key::Right,
+        ] {
+            router
+                .route(
+                    &mut surface,
+                    InputEvent::Key(KeyEvent {
+                        key,
+                        modifiers: KeyModifiers::default(),
+                    }),
+                )
+                .unwrap();
+        }
+        assert_eq!(surface.editor().selections().primary().unwrap().head, 5);
+        assert_eq!(
+            InputRouter::translate_key(&KeyEvent {
+                key: Key::PageDown,
+                modifiers: KeyModifiers::default(),
+            })
+            .unwrap(),
+            Some(EditCommand::MovePageDown { extend: false })
+        );
+    }
+
+    #[test]
+    fn fold_markers_toggle_from_the_dedicated_gutter_hit_area() {
+        let mut surface = EditorSurface::new(
+            "fn main() {\n    let value = 1;\n}\n",
+            DisplayConfig::unwrapped(),
+            SurfaceGeometry::default(),
+        );
+        assert!(surface.display().gutter(4).rows[0].foldable);
+        let mut router = InputRouter::default();
+        router
+            .route(
+                &mut surface,
+                InputEvent::Mouse(MouseEvent::Down {
+                    x: 4.0,
+                    y: 0.0,
+                    button: MouseButton::Primary,
+                    click_count: 1,
+                }),
+            )
+            .unwrap();
+        assert_eq!(surface.display().row_count(), 2);
+        assert!(surface.display().gutter(4).rows[0].folded);
+        router
+            .route(
+                &mut surface,
+                InputEvent::Key(KeyEvent {
+                    key: Key::Character("]".to_owned()),
+                    modifiers: KeyModifiers {
+                        control: true,
+                        ..KeyModifiers::default()
+                    },
+                }),
+            )
+            .unwrap();
+        assert!(!surface.display().gutter(4).rows.is_empty());
+    }
+
+    #[test]
+    fn renderer_frame_contains_syntax_tokens_active_line_and_contrasting_selection() {
+        let mut surface = surface("fn main() {\n    let value = 7;\n}\n");
+        surface.editor_mut().set_selections(SelectionSet::new([
+            Selection::range(0, 2),
+            Selection::caret(3),
+        ]));
+        let frame = surface.render_frame();
+        assert!(frame.rows.iter().any(|row| !row.tokens.is_empty()));
+        assert!(frame.rows.iter().any(|row| row.active));
+        assert!(frame.theme.primary_selection != frame.theme.background);
+        assert!(frame.gutter.rows.iter().any(|row| row.foldable));
+    }
+
+    #[test]
     fn ime_update_commit_and_cancel_route_without_stale_text() {
         let mut surface = surface("abc");
         surface.editor_mut().set_selections(SelectionSet::caret(3));
@@ -1796,16 +2327,17 @@ mod tests {
             .route(
                 &mut surface,
                 InputEvent::Mouse(MouseEvent::Down {
-                    x: 8.0,
+                    x: 64.0,
                     y: 0.0,
                     button: MouseButton::Primary,
+                    click_count: 1,
                 }),
             )
             .unwrap();
         router
             .route(
                 &mut surface,
-                InputEvent::Mouse(MouseEvent::Drag { x: 8.0, y: 20.0 }),
+                InputEvent::Mouse(MouseEvent::Drag { x: 64.0, y: 20.0 }),
             )
             .unwrap();
         assert_eq!(

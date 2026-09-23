@@ -147,8 +147,8 @@ impl Showcase {
             .id(id)
             .px_2()
             .py_1()
-            .bg(rgb(0x263449))
-            .text_color(rgb(0xd7e3f4))
+            .bg(rgb(0x202d40))
+            .text_color(rgb(0xc9d7e8))
             .rounded_sm()
             .cursor_pointer()
             .child(label)
@@ -166,8 +166,8 @@ impl Showcase {
             .id(id)
             .px_2()
             .py_1()
-            .bg(rgb(0x31445e))
-            .text_color(rgb(0xe4edf9))
+            .bg(rgb(0x2a3b54))
+            .text_color(rgb(0xe0e9f5))
             .rounded_sm()
             .cursor_pointer()
             .child(label)
@@ -186,31 +186,11 @@ enum EditorAction {
 
 impl Render for Showcase {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let toolbar = div()
-            .flex()
-            .gap_1()
-            .p_2()
-            .bg(rgb(0x182333))
-            .child(self.button(cx, "load", "Load", DemoAction::Load))
-            .child(self.button(cx, "local-edit", "Local edit", DemoAction::LocalEdit))
-            .child(self.button(cx, "replace", "Replace", DemoAction::ReplaceAll))
-            .child(self.button(cx, "save-ok", "Save OK", DemoAction::SaveSuccess))
-            .child(self.button(cx, "save-fail", "Save fail", DemoAction::SaveFailure))
-            .child(self.button(cx, "external", "External", DemoAction::ExternalConflict))
-            .child(self.button(cx, "keep", "Keep local", DemoAction::KeepLocal))
-            .child(self.button(cx, "reload", "Reload external", DemoAction::ReloadExternal))
-            .child(self.button(cx, "lsp", "Mock LSP", DemoAction::LspResults))
-            .child(self.editor_button(cx, "multi", "Multi-cursor", EditorAction::MultiCursor))
-            .child(self.editor_button(cx, "ime", "IME", EditorAction::Ime))
-            .child(self.editor_button(cx, "undo", "Undo", EditorAction::Undo))
-            .child(self.editor_button(cx, "redo", "Redo", EditorAction::Redo))
-            .child(self.editor_button(cx, "fold", "Fold", EditorAction::Fold));
-
         let diff_button = div()
             .id("diff")
             .px_2()
             .py_1()
-            .bg(rgb(0x3a4d68))
+            .bg(rgb(0x294564))
             .text_color(rgb(0xe4edf9))
             .rounded_sm()
             .cursor_pointer()
@@ -227,30 +207,90 @@ impl Render for Showcase {
             .id("decorations")
             .px_2()
             .py_1()
-            .bg(rgb(0x3a4d68))
+            .bg(rgb(0x294564))
             .text_color(rgb(0xe4edf9))
             .rounded_sm()
             .cursor_pointer()
             .child("Diagnostics")
             .on_click(cx.listener(|this, _, _, cx| this.toggle_decorations(cx)));
-        let close_buttons = div()
+        let lifecycle_actions = div()
             .flex()
             .gap_1()
+            .child(self.button(cx, "load", "Load", DemoAction::Load))
+            .child(self.button(cx, "local-edit", "Local edit", DemoAction::LocalEdit))
+            .child(self.button(cx, "replace", "Replace", DemoAction::ReplaceAll))
+            .child(self.button(cx, "save-ok", "Save", DemoAction::SaveSuccess))
+            .child(self.button(cx, "save-fail", "Fail", DemoAction::SaveFailure))
+            .child(self.button(cx, "external", "External", DemoAction::ExternalConflict))
+            .child(self.button(cx, "keep", "Keep local", DemoAction::KeepLocal))
+            .child(self.button(cx, "reload", "Reload", DemoAction::ReloadExternal))
             .child(self.button(cx, "close-save", "Close/save", DemoAction::CloseSave))
-            .child(self.button(
-                cx,
-                "close-discard",
-                "Close/discard",
-                DemoAction::CloseDiscard,
-            ))
-            .child(self.button(cx, "close-cancel", "Close/cancel", DemoAction::CloseCancel))
+            .child(self.button(cx, "close-discard", "Close/discard", DemoAction::CloseDiscard))
+            .child(self.button(cx, "close-cancel", "Close/cancel", DemoAction::CloseCancel));
+        let editor_actions = div()
+            .flex()
+            .gap_1()
+            .child(self.editor_button(cx, "multi", "Multi-cursor", EditorAction::MultiCursor))
+            .child(self.editor_button(cx, "ime", "IME", EditorAction::Ime))
+            .child(self.editor_button(cx, "undo", "Undo", EditorAction::Undo))
+            .child(self.editor_button(cx, "redo", "Redo", EditorAction::Redo))
+            .child(self.editor_button(cx, "fold", "Fold", EditorAction::Fold));
+        let showcase_actions = div()
+            .flex()
+            .gap_1()
+            .child(self.button(cx, "lsp", "Mock LSP", DemoAction::LspResults))
             .child(diff_button)
             .child(decoration_button);
+
+        let toolbar = div()
+            .flex()
+            .gap_3()
+            .p_3()
+            .bg(rgb(0x121d2c))
+            .border_b_1()
+            .border_color(rgb(0x263750))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_xs().text_color(rgb(0x7f96b3)).child("LIFECYCLE"))
+                    .child(lifecycle_actions),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_xs().text_color(rgb(0x7f96b3)).child("EDITOR"))
+                    .child(editor_actions),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_xs().text_color(rgb(0x7f96b3)).child("SHOWCASE"))
+                    .child(showcase_actions),
+            );
 
         let main_editor = div()
             .flex()
             .flex_1()
             .min_w(px(500.0))
+            .flex_col()
+            .border_1()
+            .border_color(rgb(0x2a3b54))
+            .bg(rgb(0x101925))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(0x25344a))
+                    .text_color(rgb(0x9db2cd))
+                    .child("main.rs  •  Rust  •  live editor"),
+            )
             .child(self.editor.clone());
         let content = if self.show_diff {
             div()
@@ -262,8 +302,18 @@ impl Render for Showcase {
                         .flex()
                         .flex_col()
                         .flex_1()
+                        .border_1()
+                        .border_color(rgb(0x2a3b54))
                         .bg(rgb(0x111a27))
-                        .child("ORIGINAL (read-only)")
+                        .child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(rgb(0x25344a))
+                                .text_color(rgb(0x8fa4bd))
+                                .child("ORIGINAL  •  read-only"),
+                        )
                         .child(self.diff_original.clone()),
                 )
                 .child(
@@ -271,8 +321,18 @@ impl Render for Showcase {
                         .flex()
                         .flex_col()
                         .flex_1()
+                        .border_1()
+                        .border_color(rgb(0x2a3b54))
                         .bg(rgb(0x111a27))
-                        .child("MODIFIED (editable)")
+                        .child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(rgb(0x25344a))
+                                .text_color(rgb(0xa5c9b0))
+                                .child("MODIFIED  •  editable"),
+                        )
                         .child(self.diff_modified.clone()),
                 )
         } else {
@@ -289,20 +349,30 @@ impl Render for Showcase {
             .text_color(rgb(0xd7e3f4))
             .child(
                 div()
-                    .p_3()
+                    .px_4()
+                    .py_3()
                     .bg(rgb(0x121d2c))
+                    .border_b_1()
+                    .border_color(rgb(0x263750))
                     .child("Mockaco Editor Component Showcase")
-                    .child("  •  in-memory demo data  •  native WGPUI 0.3.6"),
+                    .child("  •  Rust syntax  •  in-memory demo  •  native WGPUI"),
             )
             .child(toolbar)
-            .child(close_buttons)
-            .child(content)
             .child(
                 div()
-                    .p_2()
+                    .flex_1()
+                    .p_3()
+                    .child(content),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
                     .bg(rgb(0x182333))
+                    .border_t_1()
+                    .border_color(rgb(0x263750))
                     .child(format!(
-                        "{} | {} | diff hunks: {} | controls are host/demo actions",
+                        "{}   •   {}   •   diff hunks: {}",
                         self.state.status(),
                         self.state.lsp_status(),
                         diff_count
@@ -312,7 +382,9 @@ impl Render for Showcase {
                 div()
                     .px_2()
                     .py_1()
-                    .child("Type directly in the editor. Mouse drag selects; wheel scrolls; the IME button exercises the framework-neutral contract."),
+                    .text_xs()
+                    .text_color(rgb(0x8095af))
+                    .child("Arrows/Home/End move by display row  •  Shift extends  •  gutter chevrons fold  •  double/triple click selects"),
             )
     }
 }

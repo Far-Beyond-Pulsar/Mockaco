@@ -119,6 +119,7 @@ impl FoldRegion {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FoldSet {
     regions: Vec<FoldRegion>,
+    foldable: Vec<FoldRegion>,
 }
 
 impl FoldSet {
@@ -129,11 +130,27 @@ impl FoldSet {
             .collect();
         regions.sort_by_key(|region| (region.start_line, region.end_line));
         regions.dedup_by_key(|region| (region.start_line, region.end_line));
-        Self { regions }
+        Self {
+            regions,
+            foldable: Vec::new(),
+        }
+    }
+
+    pub fn with_foldable(
+        active: impl IntoIterator<Item = FoldRegion>,
+        foldable: impl IntoIterator<Item = FoldRegion>,
+    ) -> Self {
+        let mut set = Self::new(active);
+        set.foldable = normalize_folds(foldable);
+        set
     }
 
     pub fn regions(&self) -> &[FoldRegion] {
         &self.regions
+    }
+
+    pub fn foldable_regions(&self) -> &[FoldRegion] {
+        &self.foldable
     }
 
     pub fn is_empty(&self) -> bool {
@@ -144,9 +161,30 @@ impl FoldSet {
         self.regions.iter().find(|region| region.start_line == line)
     }
 
+    pub fn foldable_starting_at(&self, line: usize) -> Option<&FoldRegion> {
+        self.foldable
+            .iter()
+            .find(|region| region.start_line == line)
+            .or_else(|| self.region_starting_at(line))
+    }
+
+    pub fn is_foldable(&self, line: usize) -> bool {
+        self.foldable_starting_at(line).is_some()
+    }
+
     pub fn hidden_by(&self, line: usize) -> Option<&FoldRegion> {
         self.regions.iter().find(|region| region.hides_line(line))
     }
+}
+
+fn normalize_folds(regions: impl IntoIterator<Item = FoldRegion>) -> Vec<FoldRegion> {
+    let mut regions: Vec<_> = regions
+        .into_iter()
+        .filter(|region| region.start_line < region.end_line)
+        .collect();
+    regions.sort_by_key(|region| (region.start_line, region.end_line));
+    regions.dedup_by_key(|region| (region.start_line, region.end_line));
+    regions
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +242,7 @@ pub struct GutterRow {
     pub line_number: usize,
     pub continuation: bool,
     pub folded: bool,
+    pub foldable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,6 +440,19 @@ impl DisplayMap {
 
     pub fn set_folds(&mut self, folds: FoldSet) {
         self.folds = folds;
+        self.rows = build_rows(
+            &self.snapshot,
+            &self.config,
+            &self.folds,
+            0,
+            self.snapshot.position_map().line_count(),
+        );
+        self.revision = self.revision.saturating_add(1);
+        self.last_update = None;
+    }
+
+    pub fn set_foldable_regions(&mut self, foldable: impl IntoIterator<Item = FoldRegion>) {
+        self.folds = FoldSet::with_foldable(self.folds.regions().to_vec(), foldable);
         self.rows = build_rows(
             &self.snapshot,
             &self.config,
@@ -624,6 +676,7 @@ impl DisplayMap {
                 line_number: row.buffer_line + 1,
                 continuation: row.continuation,
                 folded: row.folded,
+                foldable: self.folds.is_foldable(row.buffer_line),
             })
             .collect();
         GutterLayout {
@@ -692,7 +745,7 @@ fn map_folds(
 ) -> FoldSet {
     let old_line_count = old_snapshot.position_map().line_count();
     let new_line_count = new_snapshot.position_map().line_count();
-    FoldSet::new(folds.regions().iter().filter_map(|region| {
+    let map_region = |region: &FoldRegion| {
         let start_byte = old_snapshot
             .position_map()
             .line_start(region.start_line)
@@ -722,7 +775,11 @@ fn map_folds(
         } else {
             None
         }
-    }))
+    };
+    FoldSet::with_foldable(
+        folds.regions().iter().filter_map(map_region),
+        folds.foldable_regions().iter().filter_map(map_region),
+    )
 }
 
 fn build_rows(

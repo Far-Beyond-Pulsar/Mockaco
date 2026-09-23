@@ -7,7 +7,9 @@ description = "Replaceable language-service contracts for Mockaco"
 
 [dependencies]
 mockaco-core = { path = "../mockaco-core" }
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24.2"
+streaming-iterator = "0.1.9"
 
 [lib]
 path = "src/lib.rs"
-

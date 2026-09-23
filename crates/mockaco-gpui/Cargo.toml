@@ -11,6 +11,7 @@ native-wgpui = ["dep:wgpui"]
 
 [dependencies]
 mockaco-core = { path = "../mockaco-core" }
+mockaco-language = { path = "../mockaco-language" }
 mockaco-diff = { path = "../mockaco-diff" }
 mockaco-renderer = { path = "../mockaco-renderer" }
 wgpui = { version = "0.3.6", optional = true }
