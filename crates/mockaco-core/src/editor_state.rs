@@ -107,6 +107,14 @@ impl EditorState {
         transaction: &Transaction,
         grouping: Grouping,
     ) -> Result<(), TransactionError> {
+        self.apply_with_result(transaction, grouping).map(|_| ())
+    }
+
+    pub fn apply_with_result(
+        &mut self,
+        transaction: &Transaction,
+        grouping: Grouping,
+    ) -> Result<crate::AppliedTransaction, TransactionError> {
         let before = self.document.snapshot();
         let before_selections = self.selections.clone();
         let applied = self.document.apply(transaction)?;
@@ -119,7 +127,7 @@ impl EditorState {
             self.selections.clone(),
             grouping,
         );
-        Ok(())
+        Ok(applied)
     }
 
     pub fn undo(&mut self) -> bool {
@@ -167,18 +175,28 @@ impl EditorState {
     }
 
     pub fn commit_composition(&mut self) -> Result<bool, TransactionError> {
+        self.commit_composition_with_result()
+            .map(|result| result.is_some())
+    }
+
+    pub fn commit_composition_with_result(
+        &mut self,
+    ) -> Result<Option<crate::AppliedTransaction>, TransactionError> {
         let Some(composition) = self.pending_composition.take() else {
-            return Ok(false);
+            return Ok(None);
         };
         let range_end = composition.range.start + composition.text.len();
         let transaction =
             Transaction::new().replace(composition.range.clone(), composition.text.clone());
-        if let Err(error) = self.apply(&transaction, Grouping::Separate) {
-            self.pending_composition = Some(composition);
-            return Err(error);
-        }
+        let applied = match self.apply_with_result(&transaction, Grouping::Separate) {
+            Ok(applied) => applied,
+            Err(error) => {
+                self.pending_composition = Some(composition);
+                return Err(error);
+            }
+        };
         self.selections = SelectionSet::new([Selection::caret(range_end)]);
-        Ok(true)
+        Ok(Some(applied))
     }
 
     pub fn cancel_composition(&mut self) -> bool {
