@@ -52,7 +52,9 @@ mockaco/
 │   ├── mockaco-lsp/
 │   ├── mockaco-renderer/
 │   ├── mockaco-gpui/
-│   └── mockaco-workspace/
+│   ├── mockaco-workspace/       (planned host shell)
+│   ├── mockaco-fixtures/        deterministic integration corpus
+│   └── mockaco-bench/           reproducible benchmark workloads
 ├── examples/
 │   ├── editor/
 │   ├── large-file/
@@ -329,3 +331,9 @@ Mockaco is ready to replace the current editor when it has a standalone harness,
 document and rendering benchmarks, deterministic editor-core tests, IME coverage,
 large-file coverage, LSP cancellation/version tests, and a Pulsar adapter that
 does not expose Mockaco internals or require Pulsar types in the core crates.
+
+Phase 9 supplies the standalone harness, deterministic cross-crate fixture
+corpus, and document/rendering benchmark workloads. It does not claim legacy
+implementation compatibility measurements: the legacy editor submodule is not
+available in this checkout. The Pulsar adapter and cutover remain deliberate
+post-Phase-9 work.

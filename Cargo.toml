@@ -7,4 +7,6 @@ members = [
     "crates/mockaco-gpui",
     "crates/mockaco-lsp",
     "crates/mockaco-diff",
+    "crates/mockaco-fixtures",
+    "crates/mockaco-bench",
 ]

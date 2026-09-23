@@ -1,0 +1,18 @@
+[package]
+name = "mockaco-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mockaco-core = { path = "../mockaco-core" }
+mockaco-diff = { path = "../mockaco-diff" }
+mockaco-fixtures = { path = "../mockaco-fixtures" }
+mockaco-renderer = { path = "../mockaco-renderer" }
+sha2 = "0.10"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "editor"
+harness = false

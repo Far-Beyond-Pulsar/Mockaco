@@ -1,0 +1,13 @@
+[package]
+name = "mockaco-fixtures"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mockaco-core = { path = "../mockaco-core" }
+mockaco-diff = { path = "../mockaco-diff" }
+mockaco-gpui = { path = "../mockaco-gpui" }
+mockaco-language = { path = "../mockaco-language" }
+mockaco-lsp = { path = "../mockaco-lsp" }
+mockaco-renderer = { path = "../mockaco-renderer" }
+lsp-types = "0.97"
