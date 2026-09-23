@@ -150,11 +150,58 @@ pub struct InvalidationBatch {
     pub invalidations: Vec<Invalidation>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+
+impl SurfaceColor {
+    pub const fn rgba(red: u8, green: u8, blue: u8, alpha: u8) -> Self {
+        Self {
+            red,
+            green,
+            blue,
+            alpha,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceTheme {
+    pub background: SurfaceColor,
+    pub gutter_background: SurfaceColor,
+    pub foreground: SurfaceColor,
+    pub gutter_foreground: SurfaceColor,
+    pub selection: SurfaceColor,
+    pub primary_selection: SurfaceColor,
+    pub caret: SurfaceColor,
+    pub decoration: SurfaceColor,
+}
+
+impl Default for SurfaceTheme {
+    fn default() -> Self {
+        Self {
+            background: SurfaceColor::rgba(30, 30, 30, 255),
+            gutter_background: SurfaceColor::rgba(37, 37, 38, 255),
+            foreground: SurfaceColor::rgba(220, 220, 220, 255),
+            gutter_foreground: SurfaceColor::rgba(128, 128, 128, 255),
+            selection: SurfaceColor::rgba(55, 95, 145, 180),
+            primary_selection: SurfaceColor::rgba(70, 115, 180, 210),
+            caret: SurfaceColor::rgba(235, 235, 235, 255),
+            decoration: SurfaceColor::rgba(220, 170, 70, 190),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaintRow {
     pub display_row: usize,
     pub buffer_line: usize,
     pub source_range: Range<usize>,
+    pub text: String,
     pub y: f32,
     pub height: f32,
     pub continuation: bool,
@@ -186,6 +233,16 @@ pub struct CaretGeometry {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct DecorationGeometry {
+    pub display_row: usize,
+    pub x: f32,
+    pub width: f32,
+    pub y: f32,
+    pub height: f32,
+    pub style: mockaco_renderer::DecorationStyle,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct RenderFrame {
     pub document_version: u64,
     pub viewport: DisplayViewport,
@@ -194,6 +251,8 @@ pub struct RenderFrame {
     pub selections: Vec<SelectionGeometry>,
     pub carets: Vec<CaretGeometry>,
     pub decorations: Vec<ProjectedDecoration>,
+    pub decoration_geometry: Vec<DecorationGeometry>,
+    pub theme: SurfaceTheme,
     pub invalidation_revision: u64,
 }
 
@@ -354,6 +413,7 @@ pub struct EditorSurface {
     display: DisplayMap,
     scroll: ScrollState,
     geometry: SurfaceGeometry,
+    theme: SurfaceTheme,
     decorations: Vec<Decoration>,
     invalidation: InvalidationState,
 }
@@ -371,6 +431,7 @@ impl EditorSurface {
             display,
             scroll: ScrollState::default(),
             geometry,
+            theme: SurfaceTheme::default(),
             decorations: Vec::new(),
             invalidation: InvalidationState::default(),
         };
@@ -400,6 +461,15 @@ impl EditorSurface {
 
     pub fn geometry(&self) -> SurfaceGeometry {
         self.geometry
+    }
+
+    pub fn theme(&self) -> SurfaceTheme {
+        self.theme
+    }
+
+    pub fn set_theme(&mut self, theme: SurfaceTheme) {
+        self.theme = theme;
+        self.invalidation.push(InvalidationKind::Geometry, None);
     }
 
     pub fn set_geometry(&mut self, geometry: SurfaceGeometry) {
@@ -510,6 +580,7 @@ impl EditorSurface {
                     display_row,
                     buffer_line: row.buffer_line,
                     source_range: row.start_byte..row.end_byte,
+                    text: self.display.snapshot().text()[row.start_byte..row.end_byte].to_owned(),
                     y: (display_row - self.scroll.top_row) as f32 * self.geometry.line_height,
                     height: self.geometry.line_height,
                     continuation: row.continuation,
@@ -521,11 +592,26 @@ impl EditorSurface {
         let gutter = self.display.gutter(4);
         let selections = self.selection_geometry(&viewport_range);
         let carets = self.caret_geometry(&viewport_range);
-        let decorations = self
+        let decorations: Vec<ProjectedDecoration> = self
             .display
             .project_decorations(&self.decorations)
             .into_iter()
             .filter(|decoration| viewport_range.contains(&decoration.display_row))
+            .collect();
+        let decoration_geometry = decorations
+            .iter()
+            .map(|decoration| DecorationGeometry {
+                display_row: decoration.display_row,
+                x: decoration.start_column as f32 * self.geometry.character_width,
+                width: decoration
+                    .end_column
+                    .saturating_sub(decoration.start_column) as f32
+                    * self.geometry.character_width,
+                y: (decoration.display_row - self.scroll.top_row) as f32
+                    * self.geometry.line_height,
+                height: self.geometry.line_height,
+                style: decoration.style,
+            })
             .collect();
         RenderFrame {
             document_version: self.editor.snapshot().version(),
@@ -535,6 +621,8 @@ impl EditorSurface {
             selections,
             carets,
             decorations,
+            decoration_geometry,
+            theme: self.theme,
             invalidation_revision: self.invalidation.revision(),
         }
     }
@@ -956,38 +1044,272 @@ fn mouse_to_byte(surface: &EditorSurface, x: f32, y: f32) -> Result<usize, Surfa
 
 #[cfg(feature = "native-wgpui")]
 pub mod native {
-    use super::{EditorSurface, RenderFrame};
-    use wgpui::{div, px, Context, IntoElement, ParentElement, Render, Styled, Window};
+    use super::{
+        EditorSurface, InputEvent, InputRouter, Key, KeyEvent, KeyModifiers, MouseButton,
+        MouseEvent, RenderFrame, SurfaceColor,
+    };
+    use wgpui::{
+        div, px, Context, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
+        ScrollDelta, ScrollWheelEvent, Styled, Window,
+    };
 
-    /// Thin native WGPUI view. Input handlers remain in `InputRouter` so they
-    /// can be tested without opening a native window.
+    /// Native WGPUI editor view backed by the framework-independent surface.
     pub struct WgpuiEditorView {
         pub surface: EditorSurface,
+        pub input_router: InputRouter,
+        focus_handle: Option<FocusHandle>,
     }
 
     impl WgpuiEditorView {
         pub fn new(surface: EditorSurface) -> Self {
-            Self { surface }
+            Self {
+                surface,
+                input_router: InputRouter::default(),
+                focus_handle: None,
+            }
         }
 
         pub fn render_frame(&self) -> RenderFrame {
             self.surface.render_frame()
         }
+
+        fn route(&mut self, event: InputEvent, cx: &mut Context<Self>) {
+            if self.input_router.route(&mut self.surface, event).is_ok() {
+                cx.notify();
+            }
+        }
+
+        fn on_key_down(
+            &mut self,
+            event: &wgpui::KeyDownEvent,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            let keystroke = &event.keystroke;
+            let modifiers = KeyModifiers {
+                shift: keystroke.modifiers.shift,
+                control: keystroke.modifiers.control,
+                alt: keystroke.modifiers.alt,
+                command: keystroke.modifiers.platform,
+            };
+            let key = match keystroke.key.as_str() {
+                "backspace" => Key::Backspace,
+                "delete" => Key::Delete,
+                "enter" => Key::Enter,
+                "tab" => Key::Tab,
+                "escape" => Key::Escape,
+                "left" => Key::Left,
+                "right" => Key::Right,
+                "home" => Key::Home,
+                "end" => Key::End,
+                _ => keystroke
+                    .key_char
+                    .clone()
+                    .map(Key::Character)
+                    .unwrap_or_else(|| Key::Unsupported(keystroke.key.clone())),
+            };
+            self.route(InputEvent::Key(KeyEvent { key, modifiers }), cx);
+        }
+
+        fn on_mouse_down(
+            &mut self,
+            event: &wgpui::MouseDownEvent,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            if event.button == wgpui::MouseButton::Left {
+                if let Some(handle) = &self.focus_handle {
+                    window.focus(handle, cx);
+                }
+                self.route(
+                    InputEvent::Mouse(MouseEvent::Down {
+                        x: event.position.x.as_f32(),
+                        y: event.position.y.as_f32(),
+                        button: MouseButton::Primary,
+                    }),
+                    cx,
+                );
+            }
+        }
+
+        fn on_mouse_move(
+            &mut self,
+            event: &wgpui::MouseMoveEvent,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            if event.dragging() {
+                self.route(
+                    InputEvent::Mouse(MouseEvent::Drag {
+                        x: event.position.x.as_f32(),
+                        y: event.position.y.as_f32(),
+                    }),
+                    cx,
+                );
+            }
+        }
+
+        fn on_mouse_up(
+            &mut self,
+            event: &wgpui::MouseUpEvent,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            if event.button == wgpui::MouseButton::Left {
+                self.route(
+                    InputEvent::Mouse(MouseEvent::Up {
+                        x: event.position.x.as_f32(),
+                        y: event.position.y.as_f32(),
+                        button: MouseButton::Primary,
+                    }),
+                    cx,
+                );
+            }
+        }
+
+        fn on_scroll(
+            &mut self,
+            event: &ScrollWheelEvent,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            let (vertical, horizontal) = match event.delta {
+                ScrollDelta::Lines(point) => (point.y.round() as isize, point.x.round() as isize),
+                ScrollDelta::Pixels(point) => {
+                    let geometry = self.surface.geometry();
+                    (
+                        (point.y.as_f32() / geometry.line_height.max(1.0)).round() as isize,
+                        (point.x.as_f32() / geometry.character_width.max(1.0)).round() as isize,
+                    )
+                }
+            };
+            self.route(
+                InputEvent::Scroll {
+                    vertical,
+                    horizontal,
+                },
+                cx,
+            );
+        }
     }
 
     impl Render for WgpuiEditorView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            if self.focus_handle.is_none() {
+                self.focus_handle = Some(cx.focus_handle());
+            }
             let frame = self.surface.render_frame();
-            let mut root = div().flex().flex_col();
+            let geometry = self.surface.geometry();
+            let gutter_width =
+                (frame.gutter.line_number_width as f32 + 1.0) * geometry.gutter_character_width;
+            let theme = frame.theme;
+            let mut root = div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .bg(color(theme.background))
+                .text_color(color(theme.foreground))
+                .track_focus(self.focus_handle.as_ref().unwrap())
+                .on_key_down(cx.listener(Self::on_key_down))
+                .on_mouse_down(wgpui::MouseButton::Left, cx.listener(Self::on_mouse_down))
+                .on_mouse_move(cx.listener(Self::on_mouse_move))
+                .on_mouse_up(wgpui::MouseButton::Left, cx.listener(Self::on_mouse_up))
+                .on_scroll_wheel(cx.listener(Self::on_scroll));
             for row in frame.rows {
+                let gutter = frame
+                    .gutter
+                    .rows
+                    .iter()
+                    .find(|gutter| gutter.display_row == row.display_row);
+                let mut code = div()
+                    .relative()
+                    .flex_1()
+                    .h(px(row.height))
+                    .whitespace_nowrap();
+                for selection in frame
+                    .selections
+                    .iter()
+                    .filter(|selection| selection.display_row == row.display_row)
+                {
+                    code = code.child(
+                        div()
+                            .absolute()
+                            .left(px(selection.x))
+                            .top(px(selection.y - row.y))
+                            .w(px(selection.width.max(1.0)))
+                            .h(px(selection.height))
+                            .bg(color(if selection.primary {
+                                theme.primary_selection
+                            } else {
+                                theme.selection
+                            })),
+                    );
+                }
+                for decoration in frame
+                    .decoration_geometry
+                    .iter()
+                    .filter(|decoration| decoration.display_row == row.display_row)
+                {
+                    code = code.child(
+                        div()
+                            .absolute()
+                            .left(px(decoration.x))
+                            .top(px(decoration.y - row.y))
+                            .w(px(decoration.width.max(1.0)))
+                            .h(px(decoration.height))
+                            .border_b_1()
+                            .border_color(color(theme.decoration)),
+                    );
+                }
+                code = code.child(row.text.clone());
+                for caret in frame
+                    .carets
+                    .iter()
+                    .filter(|caret| caret.display_row == row.display_row)
+                {
+                    code = code.child(
+                        div()
+                            .absolute()
+                            .left(px(caret.x))
+                            .top(px(caret.y - row.y))
+                            .w(px(if caret.primary { 2.0 } else { 1.0 }))
+                            .h(px(caret.height))
+                            .bg(color(theme.caret)),
+                    );
+                }
                 root = root.child(
                     div()
+                        .flex()
+                        .flex_row()
                         .h(px(row.height))
-                        .child(format!("{}", row.buffer_line + 1)),
+                        .child(
+                            div()
+                                .h(px(row.height))
+                                .w(px(gutter_width))
+                                .bg(color(theme.gutter_background))
+                                .text_color(color(theme.gutter_foreground))
+                                .text_right()
+                                .whitespace_nowrap()
+                                .child(format!(
+                                    "{}",
+                                    gutter.map(|gutter| gutter.line_number).unwrap_or(0)
+                                )),
+                        )
+                        .child(code),
                 );
             }
             root
         }
+    }
+
+    fn color(color: SurfaceColor) -> wgpui::Hsla {
+        wgpui::Rgba {
+            r: f32::from(color.red) / 255.0,
+            g: f32::from(color.green) / 255.0,
+            b: f32::from(color.blue) / 255.0,
+            a: f32::from(color.alpha) / 255.0,
+        }
+        .into()
     }
 }
 
@@ -1022,6 +1344,36 @@ mod tests {
         assert_eq!(frame.rows[0].buffer_line, 0);
         assert_eq!(frame.carets.len(), 1);
         assert_eq!(frame.gutter.rows[0].line_number, 1);
+    }
+
+    #[test]
+    fn render_frame_contains_text_and_visual_geometry() {
+        let mut surface = surface("first line");
+        surface.editor_mut().set_selections(SelectionSet::new([
+            Selection::range(0, 5),
+            Selection::caret(6),
+        ]));
+        surface.set_decorations(vec![Decoration::new(6..10, 7)]);
+        let frame = surface.render_frame();
+
+        assert_eq!(frame.rows[0].text, "first line");
+        assert_eq!(frame.selections.len(), 1);
+        assert_eq!(frame.selections[0].width, 5.0 * 8.0);
+        assert_eq!(frame.carets.len(), 2);
+        assert_eq!(frame.decoration_geometry.len(), 1);
+        assert_eq!(frame.decoration_geometry[0].style.id, 7);
+    }
+
+    #[test]
+    fn changing_theme_invalidates_the_presentation() {
+        let mut surface = surface("text");
+        let before = surface.invalidation().revision();
+        let mut theme = surface.theme();
+        theme.caret = SurfaceColor::rgba(255, 0, 0, 255);
+        surface.set_theme(theme);
+
+        assert_eq!(surface.theme().caret, SurfaceColor::rgba(255, 0, 0, 255));
+        assert_eq!(surface.invalidation().revision(), before + 1);
     }
 
     #[test]
