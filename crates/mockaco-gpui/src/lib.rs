@@ -382,6 +382,7 @@ pub enum ImeEvent {
 pub enum InputEvent {
     Key(KeyEvent),
     Text(String),
+    Paste(String),
     Mouse(MouseEvent),
     Scroll { vertical: isize, horizontal: isize },
     Ime(ImeEvent),
@@ -390,6 +391,9 @@ pub enum InputEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditCommand {
     InsertText(String),
+    Copy,
+    Cut,
+    Paste(String),
     DeleteBackward,
     DeleteForward,
     MoveLeft { extend: bool },
@@ -710,6 +714,42 @@ impl EditorSurface {
             .set_selections(SelectionSet::new([Selection::range(start, end)]));
         self.invalidation.push(InvalidationKind::Selection, None);
         true
+    }
+
+    /// Returns the text represented by the current selections for a platform
+    /// clipboard. Multiple carets are separated by a newline, matching the
+    /// conventional editor behavior for a multi-selection copy.
+    pub fn clipboard_text(&self) -> String {
+        let text = self.editor.document().text();
+        let selections = self.editor.selections().selections();
+        let selected = selections
+            .iter()
+            .filter(|selection| !selection.is_caret())
+            .map(|selection| text[selection.ordered_range()].to_owned())
+            .collect::<Vec<_>>();
+        if !selected.is_empty() {
+            return selected.join("\n");
+        }
+        selections
+            .iter()
+            .filter_map(|selection| {
+                let line = self
+                    .editor
+                    .document()
+                    .position_map()
+                    .byte_to_line(selection.cursor())
+                    .ok()?;
+                let start = self
+                    .editor
+                    .document()
+                    .position_map()
+                    .line_start(line)
+                    .ok()?;
+                let end = self.editor.document().position_map().line_end(line).ok()?;
+                Some(text[start..end].to_owned())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn set_search_and_diagnostic_decorations(
@@ -1224,6 +1264,24 @@ impl InputRouter {
     pub fn translate_key(event: &KeyEvent) -> Result<Option<EditCommand>, InputError> {
         let extend = event.modifiers.shift;
         let command = match &event.key {
+            Key::Character(text)
+                if (event.modifiers.control || event.modifiers.command)
+                    && text.eq_ignore_ascii_case("c") =>
+            {
+                Some(EditCommand::Copy)
+            }
+            Key::Character(text)
+                if (event.modifiers.control || event.modifiers.command)
+                    && text.eq_ignore_ascii_case("x") =>
+            {
+                Some(EditCommand::Cut)
+            }
+            Key::Character(text)
+                if (event.modifiers.control || event.modifiers.command)
+                    && text.eq_ignore_ascii_case("v") =>
+            {
+                None
+            }
             Key::Character(text) if event.modifiers.control && text == "[" => {
                 Some(EditCommand::ToggleFold)
             }
@@ -1259,6 +1317,7 @@ impl InputRouter {
     ) -> Result<InputOutcome, SurfaceError> {
         match event {
             InputEvent::Text(text) => self.apply_command(surface, EditCommand::InsertText(text)),
+            InputEvent::Paste(text) => self.apply_command(surface, EditCommand::Paste(text)),
             InputEvent::Key(event) => {
                 match Self::translate_key(&event).map_err(SurfaceError::Input)? {
                     Some(command) => self.apply_command(surface, command),
@@ -1285,6 +1344,9 @@ impl InputRouter {
     ) -> Result<InputOutcome, SurfaceError> {
         match command {
             EditCommand::InsertText(text) => self.insert_text(surface, text),
+            EditCommand::Copy => Ok(InputOutcome::handled()),
+            EditCommand::Cut => self.cut(surface),
+            EditCommand::Paste(text) => self.insert_text(surface, text),
             EditCommand::Newline => self.insert_text(surface, "\n".to_owned()),
             EditCommand::Tab => self.insert_text(surface, "\t".to_owned()),
             EditCommand::DeleteBackward => self.delete(surface, true),
@@ -1409,6 +1471,58 @@ impl InputRouter {
             selection_changed: true,
             composition_changed: false,
             scroll_changed: false,
+        })
+    }
+
+    fn cut(&mut self, surface: &mut EditorSurface) -> Result<InputOutcome, SurfaceError> {
+        let text = surface.editor.document().text();
+        let selections = surface.editor.selections().clone();
+        let mut edits = Vec::new();
+        for selection in selections.selections() {
+            let range = selection.ordered_range();
+            if range.start != range.end {
+                edits.push(Edit::delete(range));
+                continue;
+            }
+            let line = surface
+                .editor
+                .document()
+                .position_map()
+                .byte_to_line(selection.cursor())
+                .unwrap_or(0);
+            let start = surface
+                .editor
+                .document()
+                .position_map()
+                .line_start(line)
+                .unwrap_or(selection.cursor());
+            let mut end = surface
+                .editor
+                .document()
+                .position_map()
+                .line_end(line)
+                .unwrap_or(selection.cursor());
+            if end < text.len() {
+                end += text[end..].chars().next().map_or(0, char::len_utf8);
+            }
+            if start != end {
+                edits.push(Edit::delete(start..end));
+            }
+        }
+        let transaction = Transaction::from_edits(edits);
+        if transaction.is_empty() {
+            return Ok(InputOutcome::handled());
+        }
+        let applied = surface.apply_transaction(&transaction, Grouping::Separate)?;
+        surface
+            .editor
+            .set_selections(selections.map(&applied.change_map).collapse_to_carets());
+        surface.invalidation.push(InvalidationKind::Selection, None);
+        Ok(InputOutcome {
+            handled: true,
+            document_changed: true,
+            selection_changed: true,
+            ..InputOutcome::handled()
         })
     }
 
@@ -1720,16 +1834,26 @@ fn indent_guides_for_line(text: &str, start: usize, end: usize, tab_width: usize
     };
     let tab_width = tab_width.max(1);
     let mut column = 0;
-    let mut guides = Vec::new();
+    let mut first_code_column = None;
     for character in line.chars() {
         match character {
             ' ' => column += 1,
             '\t' => column += tab_width - (column % tab_width),
-            _ => break,
+            _ => {
+                first_code_column = Some(column);
+                break;
+            }
         }
-        if column > 0 && column % tab_width == 0 {
-            guides.push(column);
-        }
+    }
+    let mut guides = Vec::new();
+    let limit = first_code_column.unwrap_or(column);
+    let end = if first_code_column.is_some() {
+        limit
+    } else {
+        limit.saturating_add(1)
+    };
+    for guide in (tab_width..end).step_by(tab_width) {
+        guides.push(guide);
     }
     guides
 }
@@ -1745,8 +1869,8 @@ pub mod native {
         DIAGNOSTIC_WARNING_STYLE_ID, SEARCH_CURRENT_MATCH_STYLE_ID, SEARCH_MATCH_STYLE_ID,
     };
     use wgpui::{
-        div, font, px, Context, FocusHandle, FontFallbacks, HighlightStyle, InteractiveElement,
-        IntoElement, ParentElement, Render, ScrollDelta, ScrollWheelEvent,
+        div, font, px, ClipboardItem, Context, FocusHandle, FontFallbacks, HighlightStyle,
+        InteractiveElement, IntoElement, ParentElement, Render, ScrollDelta, ScrollWheelEvent,
         StatefulInteractiveElement, Styled, StyledText, Window,
     };
 
@@ -1791,7 +1915,10 @@ pub mod native {
             if self.read_only
                 && matches!(
                     &event,
-                    InputEvent::Text(_) | InputEvent::Key(_) | InputEvent::Ime(_)
+                    InputEvent::Text(_)
+                        | InputEvent::Paste(_)
+                        | InputEvent::Key(_)
+                        | InputEvent::Ime(_)
                 )
             {
                 return;
@@ -1814,6 +1941,42 @@ pub mod native {
                 alt: keystroke.modifiers.alt,
                 command: keystroke.modifiers.platform,
             };
+            if modifiers.control || modifiers.command {
+                if let Some(key_char) = keystroke.key_char.as_deref() {
+                    if key_char.eq_ignore_ascii_case("c") {
+                        cx.write_to_clipboard(ClipboardItem::new_string(
+                            self.surface.clipboard_text(),
+                        ));
+                        cx.notify();
+                        return;
+                    }
+                    if key_char.eq_ignore_ascii_case("x") {
+                        if !self.read_only {
+                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                self.surface.clipboard_text(),
+                            ));
+                            self.route(
+                                InputEvent::Key(KeyEvent {
+                                    key: Key::Character("x".to_owned()),
+                                    modifiers,
+                                }),
+                                cx,
+                            );
+                        }
+                        return;
+                    }
+                    if key_char.eq_ignore_ascii_case("v") {
+                        if !self.read_only {
+                            if let Some(text) =
+                                cx.read_from_clipboard().and_then(|item| item.text())
+                            {
+                                self.route(InputEvent::Paste(text), cx);
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
             let key = match keystroke.key.as_str() {
                 "backspace" => Key::Backspace,
                 "delete" => Key::Delete,
@@ -1905,8 +2068,16 @@ pub mod native {
             let geometry = self.surface.geometry();
             let (vertical, horizontal) = match event.delta {
                 ScrollDelta::Lines(point) => {
-                    self.scroll_remainder = 0.0;
-                    (point.y.round() as isize, point.x.round() as isize)
+                    // Ordinary wheel devices report line notches. Keep those
+                    // notches fractional so the translated row layer can move
+                    // between line boundaries instead of snapping immediately.
+                    let (vertical, remainder) = fractional_line_scroll(
+                        self.scroll_remainder,
+                        point.y,
+                        geometry.line_height,
+                    );
+                    self.scroll_remainder = remainder;
+                    (vertical, point.x.round() as isize)
                 }
                 ScrollDelta::Pixels(point) => {
                     let total = self.scroll_remainder + point.y.as_f32();
@@ -1918,6 +2089,16 @@ pub mod native {
                     )
                 }
             };
+            let scroll = self.surface.scroll();
+            let max_row = scroll.content_rows.saturating_sub(scroll.viewport_rows);
+            if (vertical < 0 && scroll.top_row == 0)
+                || (vertical > 0 && scroll.top_row >= max_row)
+                || (vertical == 0
+                    && ((self.scroll_remainder < 0.0 && scroll.top_row == 0)
+                        || (self.scroll_remainder > 0.0 && scroll.top_row >= max_row)))
+            {
+                self.scroll_remainder = 0.0;
+            }
             self.route(
                 InputEvent::Scroll {
                     vertical,
@@ -1926,6 +2107,13 @@ pub mod native {
                 cx,
             );
         }
+    }
+
+    fn fractional_line_scroll(remainder: f32, lines: f32, line_height: f32) -> (isize, f32) {
+        let line_height = line_height.max(1.0);
+        let total = remainder + lines * line_height * 0.45;
+        let vertical = (total / line_height).trunc() as isize;
+        (vertical, total - vertical as f32 * line_height)
     }
 
     impl Render for WgpuiEditorView {
@@ -1973,6 +2161,7 @@ pub mod native {
                 .on_mouse_down(wgpui::MouseButton::Left, cx.listener(Self::on_mouse_down))
                 .on_mouse_move(cx.listener(Self::on_mouse_move))
                 .on_mouse_up(wgpui::MouseButton::Left, cx.listener(Self::on_mouse_up))
+                .on_mouse_up_out(wgpui::MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_scroll_wheel(cx.listener(Self::on_scroll));
             let mut rows = div()
                 .flex()
@@ -2269,6 +2458,17 @@ pub mod native {
             assert_ne!(frame.theme.active_line, frame.theme.background);
             assert_ne!(frame.theme.primary_selection, frame.theme.background);
         }
+
+        #[test]
+        fn line_wheel_scroll_keeps_a_fractional_visual_remainder() {
+            let (rows, remainder) = fractional_line_scroll(0.0, 1.0, 20.0);
+            assert_eq!(rows, 0);
+            assert!((remainder - 9.0).abs() < f32::EPSILON);
+
+            let (rows, remainder) = fractional_line_scroll(remainder, 1.0, 20.0);
+            assert_eq!(rows, 0);
+            assert!((remainder - 18.0).abs() < f32::EPSILON);
+        }
     }
 }
 
@@ -2463,7 +2663,39 @@ mod tests {
     fn render_frame_exposes_four_column_indent_guides_for_spaces_and_tabs() {
         let surface = surface("fn main() {\n\t    let value = 1;\n}\n");
         let frame = surface.render_frame();
-        assert_eq!(frame.rows[1].indent_guides, vec![4, 8]);
+        assert_eq!(frame.rows[1].indent_guides, vec![4]);
+    }
+
+    #[test]
+    fn clipboard_copy_paste_and_cut_preserve_unicode_and_selections() {
+        let mut surface = surface("alpha\nβeta\n");
+        surface
+            .editor_mut()
+            .set_selections(SelectionSet::new([Selection::range(0, 5)]));
+        assert_eq!(surface.clipboard_text(), "alpha");
+
+        let mut router = InputRouter::default();
+        router
+            .route(&mut surface, InputEvent::Paste("Ω".to_owned()))
+            .unwrap();
+        assert_eq!(surface.editor().document().text(), "Ω\nβeta\n");
+
+        surface
+            .editor_mut()
+            .set_selections(SelectionSet::new([Selection::range(0, 2)]));
+        router
+            .route(
+                &mut surface,
+                InputEvent::Key(KeyEvent {
+                    key: Key::Character("x".to_owned()),
+                    modifiers: KeyModifiers {
+                        control: true,
+                        ..KeyModifiers::default()
+                    },
+                }),
+            )
+            .unwrap();
+        assert_eq!(surface.editor().document().text(), "\nβeta\n");
     }
 
     #[test]
