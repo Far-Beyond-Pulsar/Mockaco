@@ -4,19 +4,23 @@
 //! host-application dependencies. Coordinates are byte offsets unless an API
 //! explicitly says UTF-16 or line/column.
 
+mod diagnostics;
 mod document;
 mod editor_state;
 mod position_map;
+mod search;
 mod selection;
 mod transaction;
 mod undo;
 
+pub use diagnostics::{Diagnostic, DiagnosticError, DiagnosticSet, DiagnosticSeverity};
 pub use document::{Document, DocumentError, DocumentSnapshot};
 pub use editor_state::{EditorState, ImeComposition, ImeError, ViewportIntent};
 pub use position_map::{
     ByteOffset, ColumnEncoding, LineColumn, Position, PositionError, PositionMap, TextPosition,
     Utf16Offset,
 };
+pub use search::{CaseSensitivity, ReplaceResult, SearchError, SearchQuery, SearchSession};
 pub use selection::{Selection, SelectionSet};
 pub use transaction::{
     Affinity, AppliedTransaction, ChangeMap, Edit, EditError, Transaction, TransactionError,
@@ -164,5 +168,108 @@ mod tests {
         state.update_composition(5..5, "!").unwrap();
         assert!(state.cancel_composition());
         assert!(state.pending_composition().is_none());
+    }
+
+    #[test]
+    fn search_matches_unicode_byte_ranges_without_splitting_codepoints() {
+        let document = Document::new("a😀 café CAFÉ");
+        let mut session = SearchSession::new(&document.snapshot(), SearchQuery::new("é"));
+        assert_eq!(session.matches().len(), 1);
+        assert_eq!(&document.text()[session.matches()[0].clone()], "é");
+
+        session
+            .set_query(
+                &document.snapshot(),
+                SearchQuery::new("é").case_sensitivity(CaseSensitivity::Insensitive),
+            )
+            .unwrap();
+        assert_eq!(session.matches().len(), 2);
+        assert!(session.matches().iter().all(|range| {
+            &document.text()[range.clone()] == "é" || &document.text()[range.clone()] == "É"
+        }));
+    }
+
+    #[test]
+    fn search_navigation_wraps_and_reports_no_matches() {
+        let document = Document::new("one two one");
+        let mut session = SearchSession::new(&document.snapshot(), SearchQuery::new("one"));
+        assert_eq!(session.previous_match(), Some(&(8..11)));
+        assert_eq!(session.next_match(), Some(&(0..3)));
+        assert_eq!(session.next_match(), Some(&(8..11)));
+
+        let empty = SearchSession::new(&document.snapshot(), SearchQuery::new("missing"));
+        assert!(empty.matches().is_empty());
+    }
+
+    #[test]
+    fn search_refreshes_deterministically_after_a_document_edit() {
+        let mut document = Document::new("one two");
+        let initial = document.snapshot();
+        let mut session = SearchSession::new(&initial, SearchQuery::new("two"));
+        assert_eq!(session.next_match(), Some(&(4..7)));
+        let applied = document
+            .apply(&Transaction::new().insert(0, "new "))
+            .unwrap();
+        session.refresh(&document.snapshot(), &applied).unwrap();
+        assert_eq!(session.current_match(), Some(&(8..11)));
+    }
+
+    #[test]
+    fn replace_current_updates_text_and_caret_for_unicode() {
+        let mut editor = EditorState::new("α β α");
+        let mut session = SearchSession::new(&editor.snapshot(), SearchQuery::new("α"));
+        session.next_match();
+        let result = session.replace_current(&mut editor, "Ω").unwrap().unwrap();
+        assert_eq!(result.replaced_ranges, vec![0..2]);
+        assert_eq!(editor.document().text(), "Ω β α");
+        assert_eq!(editor.selections().primary().unwrap(), Selection::caret(2));
+    }
+
+    #[test]
+    fn replace_all_orders_edits_and_preserves_mapped_selections() {
+        let mut editor = EditorState::new("cat 🐈 cat");
+        editor.set_selections(SelectionSet::caret(11));
+        let mut session = SearchSession::new(&editor.snapshot(), SearchQuery::new("cat"));
+        let result = session.replace_all(&mut editor, "dog").unwrap().unwrap();
+        assert_eq!(result.replaced_ranges, vec![0..3, 9..12]);
+        assert_eq!(editor.document().text(), "dog 🐈 dog");
+        assert_eq!(editor.selections().primary().unwrap().cursor(), 12);
+    }
+
+    #[test]
+    fn diagnostics_replace_query_overlap_and_reject_stale_publication() {
+        let document = Document::new("abcdef");
+        let mut diagnostics = DiagnosticSet::new(document.version());
+        diagnostics
+            .publish(
+                &document.snapshot(),
+                [
+                    Diagnostic::new(1..4, DiagnosticSeverity::Error, "bad"),
+                    Diagnostic::new(3..5, DiagnosticSeverity::Warning, "also bad"),
+                    Diagnostic::new(3..3, DiagnosticSeverity::Info, "point"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(diagnostics.at(3).len(), 3);
+        assert_eq!(diagnostics.overlapping(2..4).len(), 3);
+        assert!(matches!(
+            diagnostics.publish(
+                &document.snapshot(),
+                [Diagnostic::new(6..7, DiagnosticSeverity::Error, "outside")],
+            ),
+            Err(DiagnosticError::InvalidRange(_))
+        ));
+
+        let applied = Document::from_snapshot(&document.snapshot())
+            .apply(&Transaction::new().insert(0, "x"))
+            .unwrap();
+        diagnostics
+            .advance_document_version(applied.after_version)
+            .unwrap();
+        assert!(diagnostics.diagnostics().is_empty());
+        assert!(matches!(
+            diagnostics.publish(&document.snapshot(), []),
+            Err(DiagnosticError::StaleDocumentVersion { .. })
+        ));
     }
 }

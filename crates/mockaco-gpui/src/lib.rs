@@ -5,12 +5,12 @@
 //! `native-wgpui` module is the only place that imports the real WGPUI crate.
 
 use mockaco_core::{
-    Affinity, DocumentSnapshot, Edit, EditorState, Grouping, Selection, SelectionSet, Transaction,
-    TransactionError,
+    Affinity, DiagnosticSet, DocumentSnapshot, Edit, EditorState, Grouping, SearchSession,
+    Selection, SelectionSet, Transaction, TransactionError,
 };
 use mockaco_renderer::{
-    Decoration, DisplayMap, DisplayMapError, DisplayPoint, DisplayViewport, GutterLayout,
-    ProjectedDecoration,
+    diagnostic_decorations, search_decorations, Decoration, DisplayMap, DisplayMapError,
+    DisplayPoint, DisplayViewport, GutterLayout, ProjectedDecoration,
 };
 use std::fmt;
 use std::ops::Range;
@@ -102,6 +102,7 @@ fn offset(value: usize, delta: isize) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidationKind {
     Document,
+    Decoration,
     Selection,
     Viewport,
     Scroll,
@@ -479,8 +480,28 @@ impl EditorSurface {
     }
 
     pub fn set_decorations(&mut self, decorations: Vec<Decoration>) {
+        let old_rows = self.decoration_rows(&self.decorations);
+        let new_rows = self.decoration_rows(&decorations);
         self.decorations = decorations;
-        self.invalidation.push(InvalidationKind::Document, None);
+        self.invalidation.push(
+            InvalidationKind::Decoration,
+            merge_ranges(old_rows, new_rows),
+        );
+    }
+
+    pub fn set_search_and_diagnostic_decorations(
+        &mut self,
+        search: Option<&SearchSession>,
+        diagnostics: Option<&DiagnosticSet>,
+    ) {
+        let mut decorations = Vec::new();
+        if let Some(search) = search {
+            decorations.extend(search_decorations(search));
+        }
+        if let Some(diagnostics) = diagnostics {
+            decorations.extend(diagnostic_decorations(diagnostics));
+        }
+        self.set_decorations(decorations);
     }
 
     pub fn set_viewport(&mut self, rows: usize, columns: usize) {
@@ -662,6 +683,20 @@ impl EditorSurface {
             .collect()
     }
 
+    fn decoration_rows(&self, decorations: &[Decoration]) -> Option<Range<usize>> {
+        let projected = self.display.project_decorations(decorations);
+        let start = projected
+            .iter()
+            .map(|decoration| decoration.display_row)
+            .min()?;
+        let end = projected
+            .iter()
+            .map(|decoration| decoration.display_row)
+            .max()?
+            .saturating_add(1);
+        Some(start..end)
+    }
+
     fn caret_geometry(&self, visible: &Range<usize>) -> Vec<CaretGeometry> {
         let selections = self.editor.selections();
         selections
@@ -701,6 +736,14 @@ impl EditorSurface {
             .unwrap_or(0);
         self.scroll.set_viewport(rows, columns);
         self.scroll.set_content(self.display.row_count(), max_width);
+    }
+}
+
+fn merge_ranges(left: Option<Range<usize>>, right: Option<Range<usize>>) -> Option<Range<usize>> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.start.min(right.start)..left.end.max(right.end)),
+        (Some(range), None) | (None, Some(range)) => Some(range),
+        (None, None) => None,
     }
 }
 
@@ -1048,6 +1091,10 @@ pub mod native {
         EditorSurface, InputEvent, InputRouter, Key, KeyEvent, KeyModifiers, MouseButton,
         MouseEvent, RenderFrame, SurfaceColor,
     };
+    use mockaco_renderer::{
+        DIAGNOSTIC_ERROR_STYLE_ID, DIAGNOSTIC_HINT_STYLE_ID, DIAGNOSTIC_INFO_STYLE_ID,
+        DIAGNOSTIC_WARNING_STYLE_ID, SEARCH_CURRENT_MATCH_STYLE_ID, SEARCH_MATCH_STYLE_ID,
+    };
     use wgpui::{
         div, px, Context, FocusHandle, InteractiveElement, IntoElement, ParentElement, Render,
         ScrollDelta, ScrollWheelEvent, Styled, Window,
@@ -1258,7 +1305,7 @@ pub mod native {
                             .w(px(decoration.width.max(1.0)))
                             .h(px(decoration.height))
                             .border_b_1()
-                            .border_color(color(theme.decoration)),
+                            .border_color(color(decoration_color(theme, decoration.style.id))),
                     );
                 }
                 code = code.child(row.text.clone());
@@ -1310,6 +1357,18 @@ pub mod native {
             a: f32::from(color.alpha) / 255.0,
         }
         .into()
+    }
+
+    fn decoration_color(theme: super::SurfaceTheme, style_id: u32) -> SurfaceColor {
+        match style_id {
+            SEARCH_MATCH_STYLE_ID => theme.selection,
+            SEARCH_CURRENT_MATCH_STYLE_ID => theme.primary_selection,
+            DIAGNOSTIC_ERROR_STYLE_ID => SurfaceColor::rgba(220, 80, 80, 255),
+            DIAGNOSTIC_WARNING_STYLE_ID => SurfaceColor::rgba(220, 170, 70, 255),
+            DIAGNOSTIC_INFO_STYLE_ID => SurfaceColor::rgba(80, 150, 220, 255),
+            DIAGNOSTIC_HINT_STYLE_ID => SurfaceColor::rgba(120, 190, 140, 255),
+            _ => theme.decoration,
+        }
     }
 }
 
@@ -1374,6 +1433,24 @@ mod tests {
 
         assert_eq!(surface.theme().caret, SurfaceColor::rgba(255, 0, 0, 255));
         assert_eq!(surface.invalidation().revision(), before + 1);
+    }
+
+    #[test]
+    fn decoration_updates_invalidate_only_projected_display_rows() {
+        let mut surface = EditorSurface::new(
+            "abcdef",
+            DisplayConfig::wrapped(3).with_wrap(Some(WrapConfig::new(3))),
+            SurfaceGeometry::default(),
+        );
+        surface.set_decorations(vec![Decoration::new(1..5, 9)]);
+        let invalidations = surface.take_invalidations();
+        assert!(matches!(
+            invalidations.invalidations.last(),
+            Some(Invalidation {
+                kind: InvalidationKind::Decoration,
+                rows: Some(rows),
+            }) if rows == &(0..2)
+        ));
     }
 
     #[test]

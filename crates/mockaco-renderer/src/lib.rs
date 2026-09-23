@@ -3,7 +3,10 @@
 //! This crate owns buffer-to-display layout only. It has no knowledge of a UI
 //! framework, glyph library, filesystem, language parser, or host application.
 
-use mockaco_core::{Affinity, AppliedTransaction, DocumentSnapshot, PositionError};
+use mockaco_core::{
+    Affinity, AppliedTransaction, DiagnosticSet, DiagnosticSeverity, DocumentSnapshot,
+    PositionError, SearchSession,
+};
 use std::fmt;
 use std::ops::Range;
 
@@ -212,6 +215,45 @@ pub struct DecorationStyle {
 pub struct Decoration {
     pub range: Range<usize>,
     pub style: DecorationStyle,
+}
+
+pub const SEARCH_MATCH_STYLE_ID: u32 = 0x1000;
+pub const SEARCH_CURRENT_MATCH_STYLE_ID: u32 = 0x1001;
+pub const DIAGNOSTIC_ERROR_STYLE_ID: u32 = 0x2000;
+pub const DIAGNOSTIC_WARNING_STYLE_ID: u32 = 0x2001;
+pub const DIAGNOSTIC_INFO_STYLE_ID: u32 = 0x2002;
+pub const DIAGNOSTIC_HINT_STYLE_ID: u32 = 0x2003;
+
+pub fn search_decorations(session: &SearchSession) -> Vec<Decoration> {
+    session
+        .matches()
+        .iter()
+        .enumerate()
+        .map(|(index, range)| {
+            let style = if session.current_match_index() == Some(index) {
+                SEARCH_CURRENT_MATCH_STYLE_ID
+            } else {
+                SEARCH_MATCH_STYLE_ID
+            };
+            Decoration::new(range.clone(), style)
+        })
+        .collect()
+}
+
+pub fn diagnostic_decorations(diagnostics: &DiagnosticSet) -> Vec<Decoration> {
+    diagnostics
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| {
+            let style = match diagnostic.severity {
+                DiagnosticSeverity::Error => DIAGNOSTIC_ERROR_STYLE_ID,
+                DiagnosticSeverity::Warning => DIAGNOSTIC_WARNING_STYLE_ID,
+                DiagnosticSeverity::Info => DIAGNOSTIC_INFO_STYLE_ID,
+                DiagnosticSeverity::Hint => DIAGNOSTIC_HINT_STYLE_ID,
+            };
+            Decoration::new(diagnostic.range.clone(), style)
+        })
+        .collect()
 }
 
 impl Decoration {
@@ -879,7 +921,10 @@ fn display_column_to_byte(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mockaco_core::{Document, Transaction};
+    use mockaco_core::{
+        Diagnostic, DiagnosticSet, DiagnosticSeverity, Document, SearchQuery, SearchSession,
+        Transaction,
+    };
 
     #[test]
     fn wrapping_and_buffer_display_mapping_are_stable() {
@@ -953,6 +998,34 @@ mod tests {
         assert_eq!(projected[0].start_column..projected[0].end_column, 1..3);
         assert_eq!(projected[1].display_row, 1);
         assert_eq!(projected[1].start_column..projected[1].end_column, 0..2);
+    }
+
+    #[test]
+    fn search_and_diagnostic_seams_preserve_source_ranges_and_styles() {
+        let document = Document::new("one two one");
+        let mut search = SearchSession::new(&document.snapshot(), SearchQuery::new("one"));
+        search.next_match();
+        let search_decorations = search_decorations(&search);
+        assert_eq!(search_decorations.len(), 2);
+        assert_eq!(
+            search_decorations[0].style.id,
+            SEARCH_CURRENT_MATCH_STYLE_ID
+        );
+        assert_eq!(search_decorations[1].style.id, SEARCH_MATCH_STYLE_ID);
+
+        let mut diagnostics = DiagnosticSet::new(document.version());
+        diagnostics
+            .publish(
+                &document.snapshot(),
+                [Diagnostic::new(4..7, DiagnosticSeverity::Error, "error")],
+            )
+            .unwrap();
+        let diagnostic_decorations = diagnostic_decorations(&diagnostics);
+        assert_eq!(diagnostic_decorations[0].range, 4..7);
+        assert_eq!(
+            diagnostic_decorations[0].style.id,
+            DIAGNOSTIC_ERROR_STYLE_ID
+        );
     }
 
     #[test]
