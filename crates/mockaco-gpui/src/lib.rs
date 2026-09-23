@@ -871,9 +871,25 @@ impl EditorSurface {
     }
 
     pub fn render_frame(&self) -> RenderFrame {
+        self.render_frame_with_buffer(0)
+    }
+
+    /// Renders the logical viewport plus presentation-only buffer rows around
+    /// it. Native scrolling uses one row on each side so fractional
+    /// translation can reveal content continuously while the editor viewport
+    /// clips the out-of-bounds rows.
+    pub fn render_frame_with_buffer(&self, buffer_rows: usize) -> RenderFrame {
         let viewport_range = self.scroll.visible_rows();
+        let render_start = self.scroll.top_row.saturating_sub(buffer_rows);
+        let render_end = self
+            .scroll
+            .top_row
+            .saturating_add(self.scroll.viewport_rows)
+            .saturating_add(buffer_rows)
+            .min(self.scroll.content_rows);
+        let render_range = render_start..render_end;
         let viewport = DisplayViewport::new(self.scroll.top_row, self.scroll.viewport_rows);
-        let rows = viewport_range
+        let rows = render_range
             .clone()
             .map(|display_row| {
                 let row = &self.display.rows()[display_row];
@@ -882,7 +898,8 @@ impl EditorSurface {
                     buffer_line: row.buffer_line,
                     source_range: row.start_byte..row.end_byte,
                     text: self.display.snapshot().text()[row.start_byte..row.end_byte].to_owned(),
-                    y: (display_row - self.scroll.top_row) as f32 * self.geometry.line_height,
+                    y: (display_row as isize - self.scroll.top_row as isize) as f32
+                        * self.geometry.line_height,
                     height: self.geometry.line_height,
                     continuation: row.continuation,
                     folded: row.folded,
@@ -2014,7 +2031,7 @@ pub mod native {
                 self.route(
                     InputEvent::Mouse(MouseEvent::Down {
                         x: event.position.x.as_f32(),
-                        y: event.position.y.as_f32(),
+                        y: event.position.y.as_f32() + self.scroll_remainder,
                         button: MouseButton::Primary,
                         click_count: event.click_count,
                     }),
@@ -2033,7 +2050,7 @@ pub mod native {
                 self.route(
                     InputEvent::Mouse(MouseEvent::Drag {
                         x: event.position.x.as_f32(),
-                        y: event.position.y.as_f32(),
+                        y: event.position.y.as_f32() + self.scroll_remainder,
                     }),
                     cx,
                 );
@@ -2051,7 +2068,7 @@ pub mod native {
                 self.route(
                     InputEvent::Mouse(MouseEvent::Up {
                         x: event.position.x.as_f32(),
-                        y: event.position.y.as_f32(),
+                        y: event.position.y.as_f32() + self.scroll_remainder,
                         button: MouseButton::Primary,
                     }),
                     cx,
@@ -2142,7 +2159,7 @@ pub mod native {
                     self.surface.scroll().viewport_columns,
                 );
             }
-            let frame = self.surface.render_frame();
+            let frame = self.surface.render_frame_with_buffer(1);
             geometry = self.surface.geometry();
             let gutter_width = self.surface.gutter_width();
             let code_padding = 12.0;
@@ -2163,10 +2180,9 @@ pub mod native {
                 .on_mouse_up(wgpui::MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_mouse_up_out(wgpui::MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_scroll_wheel(cx.listener(Self::on_scroll));
-            let mut rows = div()
+            let mut row_stack = div()
                 .flex()
                 .flex_col()
-                .flex_1()
                 .relative()
                 .top(px(-self.scroll_remainder));
             for row in frame.rows {
@@ -2288,7 +2304,7 @@ pub mod native {
                             .bg(color(theme.caret)),
                     );
                 }
-                rows = rows.child(
+                row_stack = row_stack.child(
                     div()
                         .flex()
                         .flex_row()
@@ -2387,6 +2403,15 @@ pub mod native {
                         .child(code),
                 );
             }
+            // Keep the clip rectangle in a fixed-size sibling wrapper. The
+            // translated stack is deliberately larger than this wrapper so
+            // its one-row presentation buffer can never paint outside the
+            // editor viewport.
+            let rows = div()
+                .flex_1()
+                .h(px(geometry.height))
+                .overflow_hidden()
+                .child(row_stack);
             root.child(rows)
         }
     }
@@ -2503,6 +2528,26 @@ mod tests {
         assert_eq!(frame.rows[0].buffer_line, 0);
         assert_eq!(frame.carets.len(), 1);
         assert_eq!(frame.gutter.rows[0].line_number, 1);
+    }
+
+    #[test]
+    fn buffered_render_frame_adds_one_clipped_row_on_each_side() {
+        let mut surface = surface("a\nb\nc\nd");
+        surface.set_viewport(2, 20);
+        surface.scroll_to(1, 0);
+        let frame = surface.render_frame_with_buffer(1);
+        assert_eq!(
+            frame
+                .rows
+                .iter()
+                .map(|row| row.display_row)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(frame.rows[0].y, -20.0);
+        assert_eq!(frame.rows[1].y, 0.0);
+        assert_eq!(frame.rows[3].y, 40.0);
+        assert_eq!(frame.viewport.top_row, 1);
     }
 
     #[test]
