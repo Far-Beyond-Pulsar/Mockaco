@@ -257,6 +257,80 @@ impl WgpuiEditorView {
         cx.notify();
     }
 
+    // ---- commands (menus, toolbars) ----------------------------------------
+
+    pub fn undo(&mut self, cx: &mut Context<Self>) {
+        self.undo_redo(false, cx);
+    }
+
+    pub fn redo(&mut self, cx: &mut Context<Self>) {
+        self.undo_redo(true, cx);
+    }
+
+    pub fn copy(&mut self, cx: &mut Context<Self>) {
+        let text = self.surface.clipboard_text();
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    pub fn cut(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        self.copy(cx);
+        self.route(
+            InputEvent::Key(KeyEvent {
+                key: Key::Character("x".to_owned()),
+                modifiers: KeyModifiers {
+                    control: true,
+                    ..KeyModifiers::default()
+                },
+            }),
+            cx,
+        );
+    }
+
+    pub fn paste(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.route(InputEvent::Paste(text.replace("\r\n", "\n")), cx);
+        }
+    }
+
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.route(
+            InputEvent::Key(KeyEvent {
+                key: Key::Character("a".to_owned()),
+                modifiers: KeyModifiers {
+                    control: true,
+                    ..KeyModifiers::default()
+                },
+            }),
+            cx,
+        );
+    }
+
+    pub fn unfold_all(&mut self, cx: &mut Context<Self>) {
+        self.surface.unfold_all();
+        cx.notify();
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.surface
+            .editor()
+            .selections()
+            .selections()
+            .iter()
+            .any(|selection| !selection.is_caret())
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.surface.document().position_map().line_count()
+    }
+
     // ---- per-frame preparation -------------------------------------------
 
     fn editor_font(&self) -> Font {
