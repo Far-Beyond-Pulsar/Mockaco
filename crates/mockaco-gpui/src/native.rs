@@ -594,11 +594,26 @@ impl WgpuiEditorView {
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let (mut dx, mut dy, precise) = match event.delta {
-            ScrollDelta::Lines(delta) => (
-                -delta.x * self.char_width * WHEEL_LINES,
-                -delta.y * self.line_height * WHEEL_LINES,
-                false,
-            ),
+            // Whole-number line deltas are mouse-wheel notches: scroll a few
+            // lines and glide. Fractional ones come from precision
+            // touchpads, which stream many small deltas (plus inertia) and
+            // must be followed directly or the glide fights the stream.
+            ScrollDelta::Lines(delta) => {
+                let notch = delta.x.fract() == 0.0 && delta.y.fract() == 0.0;
+                if notch {
+                    (
+                        -delta.x * self.char_width * WHEEL_LINES,
+                        -delta.y * self.line_height * WHEEL_LINES,
+                        false,
+                    )
+                } else {
+                    (
+                        -delta.x * self.char_width,
+                        -delta.y * self.line_height,
+                        true,
+                    )
+                }
+            }
             ScrollDelta::Pixels(delta) => (-delta.x.to_f32(), -delta.y.to_f32(), true),
         };
         if event.modifiers.shift && dx == 0.0 {
