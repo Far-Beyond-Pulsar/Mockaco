@@ -12,6 +12,20 @@ use std::sync::{Arc, Mutex};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{InputEdit, Language, Parser, Point, Query, QueryCursor};
 
+mod generic;
+pub use generic::{
+    lex, syntax_for_extension, syntax_for_id, Dialect, FoldStyle, GenericSyntaxProvider,
+    LanguageSyntax, LexOutput, SYNTAXES,
+};
+
+/// Rust documents up to this size are parsed whole so enclosing items keep
+/// correct highlighting and fold regions. Larger documents parse a bounded
+/// window around the requested range.
+const FULL_PARSE_BYTES: usize = 1_500_000;
+/// Context lines parsed around a request when the document exceeds
+/// `FULL_PARSE_BYTES`.
+const PARSE_CONTEXT_LINES: usize = 600;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LanguageId(String);
 
@@ -633,15 +647,18 @@ fn syntax_window(snapshot: &DocumentSnapshot, range: Range<usize>) -> Range<usiz
     if snapshot.len_bytes() == 0 {
         return 0..0;
     }
+    if snapshot.len_bytes() <= FULL_PARSE_BYTES {
+        return 0..snapshot.len_bytes();
+    }
     let position_map = snapshot.position_map();
     let first_line = position_map
         .byte_to_line(range.start)
         .unwrap_or(0)
-        .saturating_sub(1);
+        .saturating_sub(PARSE_CONTEXT_LINES);
     let last_line = position_map
         .byte_to_line(range.end)
         .unwrap_or(first_line)
-        .saturating_add(1)
+        .saturating_add(PARSE_CONTEXT_LINES)
         .min(position_map.line_count().saturating_sub(1));
     let start = position_map.line_start(first_line).unwrap_or(0);
     let end = if last_line + 1 < position_map.line_count() {
@@ -1058,14 +1075,14 @@ mod tests {
     #[test]
     fn rust_tree_sitter_restricts_non_full_requests_to_a_context_window() {
         let provider = RustTreeSitterProvider::new().unwrap();
-        let text = (0..200)
+        let text = (0..60_000)
             .map(|line| format!("fn item_{line}() {{ let value = {line}; }}"))
             .collect::<Vec<_>>()
             .join("\n");
         let document = Document::new(text);
         let snapshot = document.snapshot();
         let position_map = snapshot.position_map();
-        let requested = position_map.line_start(100).unwrap()..position_map.line_end(100).unwrap();
+        let requested = position_map.line_start(30_000).unwrap()..position_map.line_end(30_000).unwrap();
         let result = provider.highlight(&snapshot, requested.clone()).unwrap();
         let state = provider.state.lock().unwrap();
         let parsed = state.parsed_range.as_ref().unwrap();

@@ -13,7 +13,8 @@ use mockaco_diff::{
     DiffSide,
 };
 use mockaco_language::{
-    FoldingProvider, FontStyle, IncrementalHighlights, Rgba, RustTreeSitterProvider,
+    FoldRange, FoldingProvider, FontStyle, GenericSyntaxProvider, HighlightResult,
+    IncrementalHighlights, LanguageError, LanguageSyntax, Rgba, RustTreeSitterProvider,
     SyntaxHighlightProvider, Theme, TokenKind, TokenStyle,
 };
 use mockaco_renderer::{
@@ -22,6 +23,114 @@ use mockaco_renderer::{
 };
 use std::fmt;
 use std::ops::Range;
+
+pub mod chrome;
+#[cfg(feature = "native-wgpui")]
+pub mod native;
+
+/// Language the surface highlights and folds. Rust uses the bundled
+/// Tree-sitter grammar; every other known language uses the lexical provider.
+#[derive(Debug, Clone, Copy)]
+pub enum Language {
+    Plain,
+    Rust,
+    Syntax(&'static LanguageSyntax),
+}
+
+impl Language {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Plain => "text",
+            Self::Rust => "rust",
+            Self::Syntax(syntax) => syntax.id,
+        }
+    }
+
+    pub fn from_extension(extension: &str) -> Self {
+        let extension = extension.trim_start_matches('.');
+        if extension.eq_ignore_ascii_case("rs") {
+            Self::Rust
+        } else {
+            mockaco_language::syntax_for_extension(extension).map_or(Self::Plain, Self::Syntax)
+        }
+    }
+
+    pub fn from_path(path: impl AsRef<std::path::Path>) -> Self {
+        path.as_ref()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map_or(Self::Plain, Self::from_extension)
+    }
+
+    /// Line-comment prefix used by minimap tone detection and comment commands.
+    pub fn line_comment(self) -> Option<&'static str> {
+        match self {
+            Self::Plain => None,
+            Self::Rust => Some("//"),
+            Self::Syntax(syntax) => syntax.line_comments.first().copied(),
+        }
+    }
+}
+
+impl PartialEq for Language {
+    fn eq(&self, other: &Self) -> bool {
+        self.id() == other.id()
+    }
+}
+
+impl Eq for Language {}
+
+#[derive(Debug)]
+enum Highlighter {
+    Plain,
+    Rust(RustTreeSitterProvider),
+    Generic(GenericSyntaxProvider),
+}
+
+impl Highlighter {
+    fn new(language: Language) -> Self {
+        match language {
+            Language::Plain => Self::Plain,
+            Language::Rust => {
+                Self::Rust(RustTreeSitterProvider::new().expect("Rust Tree-sitter provider loads"))
+            }
+            Language::Syntax(syntax) => Self::Generic(GenericSyntaxProvider::new(syntax)),
+        }
+    }
+
+    fn highlight(
+        &self,
+        snapshot: &DocumentSnapshot,
+        range: Range<usize>,
+    ) -> Result<HighlightResult, LanguageError> {
+        match self {
+            Self::Plain => Err(LanguageError::Provider("plain text".into())),
+            Self::Rust(provider) => provider.highlight(snapshot, range),
+            Self::Generic(provider) => provider.highlight(snapshot, range),
+        }
+    }
+
+    fn fold_ranges(
+        &self,
+        snapshot: &DocumentSnapshot,
+        range: Range<usize>,
+    ) -> Result<Vec<FoldRange>, LanguageError> {
+        match self {
+            Self::Plain => Ok(Vec::new()),
+            Self::Rust(provider) => provider.fold_ranges(snapshot, range),
+            Self::Generic(provider) => provider.fold_ranges(snapshot, range),
+        }
+    }
+}
+
+/// Minimum digits reserved for line numbers.
+pub const GUTTER_MIN_DIGITS: usize = 3;
+/// Width of the diagnostic/search marker column at the gutter's left edge.
+pub const GUTTER_MARKER_WIDTH: f32 = 14.0;
+/// Gap between the line numbers and the fold chevron column.
+pub const GUTTER_NUMBER_PADDING: f32 = 6.0;
+/// Width of the fold chevron column at the gutter's right edge.
+pub const GUTTER_FOLD_WIDTH: f32 = 18.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SurfaceGeometry {
@@ -35,7 +144,11 @@ pub struct SurfaceGeometry {
 /// Horizontal breathing room between the gutter and the first code column in
 /// the native presentation. Mouse hit testing uses the same constant as paint
 /// so a click lands on the glyph under the pointer.
-const CODE_PADDING: f32 = 12.0;
+pub const CODE_PADDING: f32 = 12.0;
+
+/// Extra columns of horizontal scroll range beyond the longest line, so the
+/// caret at a line's end is never flush against the viewport edge.
+const HORIZONTAL_SCROLL_SLACK: usize = 6;
 
 impl Default for SurfaceGeometry {
     fn default() -> Self {
@@ -257,6 +370,15 @@ fn syntax_theme() -> Theme {
     for kind in ["operator", "punctuation.bracket", "punctuation.delimiter"] {
         theme.set_token_style(kind, style(171, 178, 191));
     }
+    for kind in ["tag", "title", "label"] {
+        theme.set_token_style(kind, style(224, 108, 117));
+    }
+    for kind in ["variable", "variable.builtin", "link_text", "emphasis"] {
+        theme.set_token_style(kind, style(224, 108, 117));
+    }
+    for kind in ["link_uri", "punctuation.list_marker", "emphasis.strong"] {
+        theme.set_token_style(kind, style(86, 182, 194));
+    }
     theme
 }
 
@@ -348,6 +470,12 @@ pub enum MouseEvent {
         x: f32,
         y: f32,
     },
+    /// Shift+click: extends the primary selection from its anchor to the
+    /// pointer and starts a drag from that anchor.
+    Extend {
+        x: f32,
+        y: f32,
+    },
     Up {
         x: f32,
         y: f32,
@@ -421,10 +549,18 @@ pub enum EditCommand {
     MovePageDown { extend: bool },
     MoveHome { extend: bool },
     MoveEnd { extend: bool },
+    MoveWordLeft { extend: bool },
+    MoveWordRight { extend: bool },
+    MoveDocumentStart { extend: bool },
+    MoveDocumentEnd { extend: bool },
+    DeleteWordBackward,
+    DeleteWordForward,
+    SelectAll,
     ToggleFold,
     UnfoldAll,
     Newline,
     Tab,
+    Outdent,
     CancelComposition,
 }
 
@@ -519,7 +655,8 @@ impl InputOutcome {
 pub struct EditorSurface {
     editor: EditorState,
     display: DisplayMap,
-    highlighter: RustTreeSitterProvider,
+    highlighter: Highlighter,
+    language: Language,
     highlights: IncrementalHighlights,
     language_coverage: Option<(u64, Range<usize>)>,
     scroll: ScrollState,
@@ -535,15 +672,25 @@ impl EditorSurface {
         display_config: mockaco_renderer::DisplayConfig,
         geometry: SurfaceGeometry,
     ) -> Self {
+        Self::with_language(text, display_config, geometry, Language::Rust)
+    }
+
+    pub fn with_language(
+        text: impl Into<String>,
+        display_config: mockaco_renderer::DisplayConfig,
+        geometry: SurfaceGeometry,
+        language: Language,
+    ) -> Self {
         let editor = EditorState::new(text);
         let snapshot = editor.snapshot();
-        let highlighter = RustTreeSitterProvider::new().expect("Rust Tree-sitter provider loads");
+        let highlighter = Highlighter::new(language);
         let highlights = IncrementalHighlights::new();
         let display = DisplayMap::new(&snapshot, display_config);
         let mut surface = Self {
             editor,
             display,
             highlighter,
+            language,
             highlights,
             language_coverage: None,
             scroll: ScrollState::default(),
@@ -555,6 +702,23 @@ impl EditorSurface {
         surface.recompute_scroll_viewport();
         surface.ensure_language_state_for_viewport();
         surface
+    }
+
+    pub fn language(&self) -> Language {
+        self.language
+    }
+
+    /// Switches the highlighting/folding language and re-derives the
+    /// language state for the current viewport.
+    pub fn set_language(&mut self, language: Language) {
+        if self.language == language {
+            return;
+        }
+        self.language = language;
+        self.highlighter = Highlighter::new(language);
+        let snapshot = self.editor.snapshot();
+        self.refresh_language_state(&snapshot);
+        self.invalidation.push(InvalidationKind::Document, None);
     }
 
     pub fn editor(&self) -> &EditorState {
@@ -682,8 +846,19 @@ impl EditorSurface {
         self.invalidation.push(InvalidationKind::Geometry, None);
     }
 
+    /// Total gutter width: marker column, line numbers, padding, fold chevron.
+    /// Paint and hit testing both derive from this so they cannot drift.
     pub fn gutter_width(&self) -> f32 {
-        (self.display.line_number_width(4) as f32 + 3.0) * self.geometry.gutter_character_width
+        GUTTER_MARKER_WIDTH
+            + self.number_column_width()
+            + GUTTER_NUMBER_PADDING
+            + GUTTER_FOLD_WIDTH
+    }
+
+    /// Width of the right-aligned line-number column.
+    pub fn number_column_width(&self) -> f32 {
+        self.display.line_number_width(GUTTER_MIN_DIGITS) as f32
+            * self.geometry.gutter_character_width
     }
 
     pub fn select_word_at(&mut self, byte: usize) -> bool {
@@ -805,8 +980,10 @@ impl EditorSurface {
     }
 
     /// Keeps the primary caret inside the logical viewport after navigation or
-    /// an edit. The native adapter may animate the resulting one-row changes,
-    /// but the invariant is owned by the framework-independent surface.
+    /// an edit, in both axes. The native adapter animates the resulting
+    /// change, but the invariant is owned by the framework-independent
+    /// surface. Only fully visible rows count, so the caret is never revealed
+    /// into a clipped row.
     pub fn reveal_primary_caret(&mut self) -> bool {
         let Some(selection) = self.editor.selections().primary() else {
             return false;
@@ -817,15 +994,27 @@ impl EditorSurface {
         else {
             return false;
         };
-        let viewport_rows = self.scroll.viewport_rows.max(1);
+        let full_rows = ((self.geometry.height / self.geometry.line_height.max(1.0)).floor()
+            as usize)
+            .clamp(1, self.scroll.viewport_rows.max(1));
         let target_row = if point.row < self.scroll.top_row {
             point.row
-        } else if point.row >= self.scroll.top_row.saturating_add(viewport_rows) {
-            point.row.saturating_sub(viewport_rows.saturating_sub(1))
+        } else if point.row >= self.scroll.top_row.saturating_add(full_rows) {
+            point.row.saturating_sub(full_rows.saturating_sub(1))
         } else {
             self.scroll.top_row
         };
-        self.scroll_to(target_row, self.scroll.horizontal_columns)
+        let columns = self.scroll.viewport_columns.max(1);
+        let margin = 2.min(columns / 4);
+        let left = self.scroll.horizontal_columns;
+        let target_column = if point.column < left.saturating_add(margin) {
+            point.column.saturating_sub(margin)
+        } else if point.column + margin >= left.saturating_add(columns) {
+            (point.column + margin + 1).saturating_sub(columns)
+        } else {
+            left
+        };
+        self.scroll_to(target_row, target_column)
     }
 
     pub fn invalidation(&self) -> &InvalidationState {
@@ -851,13 +1040,22 @@ impl EditorSurface {
             .highlights
             .apply_transaction(&before_snapshot, &applied);
         self.language_coverage = None;
-        if let Ok(result) = self.highlighter.apply_transaction(
-            &before_snapshot,
-            &snapshot,
-            &applied,
-            update.new_range.clone(),
-        ) {
-            let _ = self.highlights.accept_range(result);
+        match &self.highlighter {
+            Highlighter::Rust(provider) => {
+                if let Ok(result) = provider.apply_transaction(
+                    &before_snapshot,
+                    &snapshot,
+                    &applied,
+                    update.new_range.clone(),
+                ) {
+                    let _ = self.highlights.accept_range(result);
+                }
+            }
+            // Lexical results can change anywhere below an edit (an opened
+            // string or comment), so they are re-derived for the viewport.
+            Highlighter::Generic(_) | Highlighter::Plain => {
+                self.highlights = IncrementalHighlights::new();
+            }
         }
         self.recompute_scroll_viewport();
         self.ensure_language_state_for_viewport();
@@ -981,7 +1179,7 @@ impl EditorSurface {
             .collect::<Vec<_>>();
         let gutter = self
             .display
-            .gutter_for_display_range(4, render_range.clone());
+            .gutter_for_display_range(GUTTER_MIN_DIGITS, render_range.clone());
         let selections = self.selection_geometry(&render_range);
         let carets = self.caret_geometry(&render_range);
         let decorations: Vec<ProjectedDecoration> = self
@@ -1105,14 +1303,19 @@ impl EditorSurface {
     }
 
     fn recompute_scroll_viewport(&mut self) {
-        let rows = (self.geometry.height / self.geometry.line_height.max(1.0)).floor() as usize;
+        // A partially visible bottom row still counts as viewport so it is
+        // rendered and highlighted while smooth scrolling.
+        let rows = ((self.geometry.height / self.geometry.line_height.max(1.0)).ceil() as usize)
+            .max(1);
         let columns =
             (self.geometry.width / self.geometry.character_width.max(1.0)).floor() as usize;
         self.scroll.set_viewport(rows, columns);
+        // Like VS Code's `scrollBeyondLastLine`, the final line can scroll up
+        // to the top edge: reserve (viewport - 1) presentation-only rows.
         self.scroll.set_content_with_bottom_padding(
             self.display.row_count(),
-            self.display.max_display_width(),
-            1,
+            self.display.max_display_width() + HORIZONTAL_SCROLL_SLACK,
+            rows.saturating_sub(1),
         );
     }
 
@@ -1135,30 +1338,45 @@ impl EditorSurface {
     }
 
     fn ensure_language_state_for_viewport(&mut self) {
+        if matches!(self.highlighter, Highlighter::Plain) {
+            return;
+        }
         let document_version = self.display.snapshot().version();
         let rows = self.display.rows();
-        let start_row = self.scroll.top_row.min(rows.len());
-        let end_row = start_row
-            .saturating_add(self.scroll.viewport_rows.saturating_add(1))
-            .min(rows.len());
-        let Some(first) = rows.get(start_row) else {
+        if rows.is_empty() {
             return;
-        };
-        let last = rows
-            .get(end_row.saturating_sub(1).max(start_row))
-            .unwrap_or(first);
-        let requested = first.start_byte..last.end_byte;
+        }
+        // Rows the frame will paint: the viewport plus the smooth-scroll
+        // buffer on both sides.
+        let top = self.scroll.top_row.min(rows.len() - 1);
+        let needed_start = top.saturating_sub(1);
+        let needed_end = top
+            .saturating_add(self.scroll.viewport_rows.saturating_add(2))
+            .min(rows.len());
+        let needed = rows[needed_start].start_byte..rows[needed_end - 1].end_byte;
         if self
             .language_coverage
             .as_ref()
             .is_some_and(|(version, covered)| {
                 *version == document_version
-                    && covered.start <= requested.start
-                    && covered.end >= requested.end
+                    && covered.start <= needed.start
+                    && covered.end >= needed.end
             })
         {
             return;
         }
+
+        // Highlight a generous window around the viewport so ordinary
+        // scrolling never leaves unhighlighted rows or fold markers behind.
+        let pad = self.scroll.viewport_rows.max(48);
+        let start_row = top.saturating_sub(pad);
+        let end_row = top
+            .saturating_add(self.scroll.viewport_rows)
+            .saturating_add(pad)
+            .min(rows.len());
+        let first = &rows[start_row];
+        let last = &rows[end_row - 1];
+        let requested = first.start_byte..last.end_byte;
 
         if let Ok(result) = self
             .highlighter
@@ -1364,11 +1582,66 @@ fn display_y(display_row: usize, top_row: usize, line_height: f32) -> f32 {
 pub struct InputRouter {
     drag_anchor: Option<usize>,
     goal_column: Option<usize>,
+    /// The previous routed event was a single typed character.
+    typing: bool,
+    /// The event being routed continues the previous typing run, so its
+    /// edit merges into the current undo group.
+    group_next: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    Space,
+    Word,
+    Punctuation,
+}
+
+fn char_class(character: char) -> CharClass {
+    if character.is_whitespace() {
+        CharClass::Space
+    } else if character.is_alphanumeric() || character == '_' {
+        CharClass::Word
+    } else {
+        CharClass::Punctuation
+    }
+}
+
+/// Next word boundary from `from`: skip whitespace, then one run of a single
+/// character class.
+fn word_boundary(text: &str, from: usize, forward: bool) -> usize {
+    let from = from.min(text.len());
+    if forward {
+        let mut index = from;
+        let mut chars = text[from..].chars().peekable();
+        while let Some(character) = chars.next_if(|c| char_class(*c) == CharClass::Space) {
+            index += character.len_utf8();
+        }
+        if let Some(class) = chars.peek().map(|c| char_class(*c)) {
+            while let Some(character) = chars.next_if(|c| char_class(*c) == class) {
+                index += character.len_utf8();
+            }
+        }
+        index
+    } else {
+        let mut index = from;
+        let mut chars = text[..from].chars().rev().peekable();
+        while let Some(character) = chars.next_if(|c| char_class(*c) == CharClass::Space) {
+            index -= character.len_utf8();
+        }
+        if let Some(class) = chars.peek().map(|c| char_class(*c)) {
+            while let Some(character) = chars.next_if(|c| char_class(*c) == class) {
+                index -= character.len_utf8();
+            }
+        }
+        index
+    }
 }
 
 impl InputRouter {
     pub fn translate_key(event: &KeyEvent) -> Result<Option<EditCommand>, InputError> {
         let extend = event.modifiers.shift;
+        // Ctrl (or Cmd) moves by word / to the document edge.
+        let word = event.modifiers.control || event.modifiers.command;
         let command = match &event.key {
             Key::Character(text)
                 if (event.modifiers.control || event.modifiers.command)
@@ -1388,6 +1661,12 @@ impl InputRouter {
             {
                 None
             }
+            Key::Character(text)
+                if (event.modifiers.control || event.modifiers.command)
+                    && text.eq_ignore_ascii_case("a") =>
+            {
+                Some(EditCommand::SelectAll)
+            }
             Key::Character(text) if event.modifiers.control && text == "[" => {
                 Some(EditCommand::ToggleFold)
             }
@@ -1397,17 +1676,24 @@ impl InputRouter {
             Key::Character(text) if !event.modifiers.control && !event.modifiers.command => {
                 Some(EditCommand::InsertText(text.clone()))
             }
+            Key::Backspace if word => Some(EditCommand::DeleteWordBackward),
+            Key::Delete if word => Some(EditCommand::DeleteWordForward),
             Key::Backspace => Some(EditCommand::DeleteBackward),
             Key::Delete => Some(EditCommand::DeleteForward),
             Key::Enter => Some(EditCommand::Newline),
+            Key::Tab if event.modifiers.shift => Some(EditCommand::Outdent),
             Key::Tab => Some(EditCommand::Tab),
             Key::Escape => Some(EditCommand::CancelComposition),
+            Key::Left if word => Some(EditCommand::MoveWordLeft { extend }),
+            Key::Right if word => Some(EditCommand::MoveWordRight { extend }),
             Key::Left => Some(EditCommand::MoveLeft { extend }),
             Key::Right => Some(EditCommand::MoveRight { extend }),
             Key::Up => Some(EditCommand::MoveUp { extend }),
             Key::Down => Some(EditCommand::MoveDown { extend }),
             Key::PageUp => Some(EditCommand::MovePageUp { extend }),
             Key::PageDown => Some(EditCommand::MovePageDown { extend }),
+            Key::Home if word => Some(EditCommand::MoveDocumentStart { extend }),
+            Key::End if word => Some(EditCommand::MoveDocumentEnd { extend }),
             Key::Home => Some(EditCommand::MoveHome { extend }),
             Key::End => Some(EditCommand::MoveEnd { extend }),
             Key::Character(_) => None,
@@ -1421,6 +1707,13 @@ impl InputRouter {
         surface: &mut EditorSurface,
         event: InputEvent,
     ) -> Result<InputOutcome, SurfaceError> {
+        // Consecutive single-character typing merges into one undo step.
+        let typed = matches!(&event, InputEvent::Text(text)
+            if text.chars().count() == 1 && !text.contains('\n'));
+        self.group_next = typed && self.typing;
+        if !matches!(event, InputEvent::Scroll { .. }) {
+            self.typing = false;
+        }
         let mut outcome = match event {
             InputEvent::Text(text) => self.apply_command(surface, EditCommand::InsertText(text)),
             InputEvent::Paste(text) => self.apply_command(surface, EditCommand::Paste(text)),
@@ -1441,10 +1734,262 @@ impl InputRouter {
             InputEvent::Ime(event) => self.route_ime(surface, event),
             InputEvent::Mouse(event) => self.route_mouse(surface, event),
         }?;
+        self.typing = typed && outcome.document_changed;
         if outcome.selection_changed || outcome.document_changed {
             outcome.scroll_changed |= surface.reveal_primary_caret();
         }
         Ok(outcome)
+    }
+
+    fn grouping(&self) -> Grouping {
+        if self.group_next {
+            Grouping::CurrentGroup
+        } else {
+            Grouping::Separate
+        }
+    }
+
+    fn tab_width(surface: &EditorSurface) -> usize {
+        surface.display.config().tab_width.max(1)
+    }
+
+    /// Moves every selection head with `target`, extending when requested.
+    fn move_to(
+        &mut self,
+        surface: &mut EditorSurface,
+        extend: bool,
+        target: impl Fn(&str, usize) -> usize,
+    ) -> Result<InputOutcome, SurfaceError> {
+        let text = surface.editor.document().text();
+        let next = surface
+            .editor
+            .selections()
+            .selections()
+            .iter()
+            .map(|selection| {
+                let to = target(text, selection.head);
+                if extend {
+                    Selection::range(selection.anchor, to)
+                } else {
+                    Selection::caret(to)
+                }
+            })
+            .collect::<Vec<_>>();
+        surface.editor.set_selections(SelectionSet::new(next));
+        self.goal_column = None;
+        surface.invalidation.push(InvalidationKind::Selection, None);
+        Ok(InputOutcome {
+            selection_changed: true,
+            ..InputOutcome::handled()
+        })
+    }
+
+    fn delete_word(
+        &mut self,
+        surface: &mut EditorSurface,
+        forward: bool,
+    ) -> Result<InputOutcome, SurfaceError> {
+        let text = surface.editor.document().text();
+        let selections = surface.editor.selections().clone();
+        let edits = selections
+            .selections()
+            .iter()
+            .filter_map(|selection| {
+                let range = selection.ordered_range();
+                if range.start != range.end {
+                    return Some(range);
+                }
+                let other = word_boundary(text, selection.head, forward);
+                let range = other.min(selection.head)..other.max(selection.head);
+                (range.start != range.end).then_some(range)
+            })
+            .map(Edit::delete)
+            .collect::<Vec<_>>();
+        let transaction = Transaction::from_edits(edits);
+        if transaction.is_empty() {
+            return Ok(InputOutcome::handled());
+        }
+        let applied = surface.apply_transaction(&transaction, Grouping::Separate)?;
+        surface
+            .editor
+            .set_selections(selections.map(&applied.change_map).collapse_to_carets());
+        surface.invalidation.push(InvalidationKind::Selection, None);
+        Ok(InputOutcome {
+            document_changed: true,
+            selection_changed: true,
+            ..InputOutcome::handled()
+        })
+    }
+
+    /// Enter: keeps the current line's indentation, adds one level after an
+    /// opening bracket, and splits `{|}` onto three lines.
+    fn newline(&mut self, surface: &mut EditorSurface) -> Result<InputOutcome, SurfaceError> {
+        let unit = " ".repeat(Self::tab_width(surface));
+        let text = surface.editor.document().text();
+        let map = surface.editor.document().position_map();
+        let selections = surface.editor.selections().clone();
+        let mut edits = Vec::new();
+        let mut caret_offsets = Vec::new();
+        for selection in selections.selections() {
+            let range = selection.ordered_range();
+            let line = map.byte_to_line(range.start).unwrap_or(0);
+            let line_start = map.line_start(line).unwrap_or(0);
+            let before_caret = &text[line_start..range.start];
+            let leading: String = before_caret
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            let before = before_caret.trim_end().chars().last();
+            let after = text[range.end..].chars().next();
+            let opens = matches!(before, Some('{' | '(' | '['));
+            let closes = matches!(
+                (before, after),
+                (Some('{'), Some('}')) | (Some('('), Some(')')) | (Some('['), Some(']'))
+            );
+            let mut first = format!("\n{leading}");
+            if opens {
+                first.push_str(&unit);
+            }
+            let caret = first.len();
+            let insert = if closes {
+                format!("{first}\n{leading}")
+            } else {
+                first
+            };
+            caret_offsets.push(caret);
+            edits.push(Edit::replace(range, insert));
+        }
+        let transaction = Transaction::from_edits(edits);
+        let applied = surface.apply_transaction(&transaction, Grouping::Separate)?;
+        let carets = selections
+            .selections()
+            .iter()
+            .zip(caret_offsets)
+            .map(|(selection, offset)| {
+                let start = applied
+                    .change_map
+                    .map_offset(selection.ordered_range().start, Affinity::Before);
+                Selection::caret(start + offset)
+            })
+            .collect::<Vec<_>>();
+        surface.editor.set_selections(SelectionSet::new(carets));
+        surface.invalidation.push(InvalidationKind::Selection, None);
+        Ok(InputOutcome {
+            document_changed: true,
+            selection_changed: true,
+            ..InputOutcome::handled()
+        })
+    }
+
+    /// Tab: indents every touched line for a multi-line selection, otherwise
+    /// inserts spaces up to the next tab stop.
+    fn indent(&mut self, surface: &mut EditorSurface) -> Result<InputOutcome, SurfaceError> {
+        let width = Self::tab_width(surface);
+        let unit = " ".repeat(width);
+        let text = surface.editor.document().text();
+        let map = surface.editor.document().position_map();
+        let selections = surface.editor.selections().clone();
+        let multiline = selections.selections().iter().any(|selection| {
+            let range = selection.ordered_range();
+            range.start != range.end
+                && map.byte_to_line(range.start).ok() != map.byte_to_line(range.end).ok()
+        });
+        if !multiline {
+            let edits = selections.selections().iter().map(|selection| {
+                let range = selection.ordered_range();
+                let line = map.byte_to_line(range.start).unwrap_or(0);
+                let line_start = map.line_start(line).unwrap_or(0);
+                let column = text[line_start..range.start]
+                    .chars()
+                    .fold(0, |column, c| {
+                        column + if c == '\t' { width - column % width } else { 1 }
+                    });
+                Edit::replace(range, " ".repeat(width - column % width))
+            });
+            let transaction = Transaction::from_edits(edits);
+            let applied = surface.apply_transaction(&transaction, self.grouping())?;
+            let carets = selections.selections().iter().map(|selection| {
+                Selection::caret(
+                    applied
+                        .change_map
+                        .map_offset(selection.ordered_range().end, Affinity::After),
+                )
+            });
+            surface.editor.set_selections(SelectionSet::new(carets));
+        } else {
+            let mut lines = std::collections::BTreeSet::new();
+            for selection in selections.selections() {
+                let range = selection.ordered_range();
+                let first = map.byte_to_line(range.start).unwrap_or(0);
+                let mut last = map.byte_to_line(range.end).unwrap_or(first);
+                // A selection ending at a line's very start excludes that line.
+                if last > first && map.line_start(last).ok() == Some(range.end) {
+                    last -= 1;
+                }
+                lines.extend(first..=last);
+            }
+            let edits = lines
+                .iter()
+                .filter_map(|line| map.line_start(*line).ok())
+                .map(|start| Edit::insert(start, unit.clone()))
+                .collect::<Vec<_>>();
+            let transaction = Transaction::from_edits(edits);
+            let applied = surface.apply_transaction(&transaction, Grouping::Separate)?;
+            surface
+                .editor
+                .set_selections(selections.map(&applied.change_map));
+        }
+        surface.invalidation.push(InvalidationKind::Selection, None);
+        Ok(InputOutcome {
+            document_changed: true,
+            selection_changed: true,
+            ..InputOutcome::handled()
+        })
+    }
+
+    /// Shift+Tab: removes one indent level from every touched line.
+    fn outdent(&mut self, surface: &mut EditorSurface) -> Result<InputOutcome, SurfaceError> {
+        let width = Self::tab_width(surface);
+        let text = surface.editor.document().text();
+        let map = surface.editor.document().position_map();
+        let selections = surface.editor.selections().clone();
+        let mut lines = std::collections::BTreeSet::new();
+        for selection in selections.selections() {
+            let range = selection.ordered_range();
+            let first = map.byte_to_line(range.start).unwrap_or(0);
+            let mut last = map.byte_to_line(range.end).unwrap_or(first);
+            if last > first && map.line_start(last).ok() == Some(range.end) {
+                last -= 1;
+            }
+            lines.extend(first..=last);
+        }
+        let edits = lines
+            .iter()
+            .filter_map(|line| {
+                let start = map.line_start(*line).ok()?;
+                let leading = &text[start..];
+                let removable = if leading.starts_with('\t') {
+                    1
+                } else {
+                    leading.bytes().take(width).take_while(|b| *b == b' ').count()
+                };
+                (removable > 0).then(|| Edit::delete(start..start + removable))
+            })
+            .collect::<Vec<_>>();
+        let transaction = Transaction::from_edits(edits);
+        if transaction.is_empty() {
+            return Ok(InputOutcome::handled());
+        }
+        let applied = surface.apply_transaction(&transaction, Grouping::Separate)?;
+        surface
+            .editor
+            .set_selections(selections.map(&applied.change_map));
+        surface.invalidation.push(InvalidationKind::Selection, None);
+        Ok(InputOutcome {
+            document_changed: true,
+            selection_changed: true,
+            ..InputOutcome::handled()
+        })
     }
 
     fn apply_command(
@@ -1457,8 +2002,35 @@ impl InputRouter {
             EditCommand::Copy => Ok(InputOutcome::handled()),
             EditCommand::Cut => self.cut(surface),
             EditCommand::Paste(text) => self.insert_text(surface, text),
-            EditCommand::Newline => self.insert_text(surface, "\n".to_owned()),
-            EditCommand::Tab => self.insert_text(surface, "\t".to_owned()),
+            EditCommand::Newline => self.newline(surface),
+            EditCommand::Tab => self.indent(surface),
+            EditCommand::Outdent => self.outdent(surface),
+            EditCommand::SelectAll => {
+                let end = surface.editor.document().text().len();
+                surface
+                    .editor
+                    .set_selections(SelectionSet::new([Selection::range(0, end)]));
+                surface.invalidation.push(InvalidationKind::Selection, None);
+                self.goal_column = None;
+                Ok(InputOutcome {
+                    selection_changed: true,
+                    ..InputOutcome::handled()
+                })
+            }
+            EditCommand::MoveWordLeft { extend } => {
+                self.move_to(surface, extend, |text, head| word_boundary(text, head, false))
+            }
+            EditCommand::MoveWordRight { extend } => {
+                self.move_to(surface, extend, |text, head| word_boundary(text, head, true))
+            }
+            EditCommand::MoveDocumentStart { extend } => {
+                self.move_to(surface, extend, |_, _| 0)
+            }
+            EditCommand::MoveDocumentEnd { extend } => {
+                self.move_to(surface, extend, |text, _| text.len())
+            }
+            EditCommand::DeleteWordBackward => self.delete_word(surface, false),
+            EditCommand::DeleteWordForward => self.delete_word(surface, true),
             EditCommand::DeleteBackward => self.delete(surface, true),
             EditCommand::DeleteForward => self.delete(surface, false),
             EditCommand::MoveLeft { extend } => self.move_horizontal(surface, false, extend),
@@ -1525,7 +2097,7 @@ impl InputRouter {
                 .iter()
                 .map(|selection| Edit::replace(selection.ordered_range(), text.clone())),
         );
-        let applied = surface.apply_transaction(&transaction, Grouping::Separate)?;
+        let applied = surface.apply_transaction(&transaction, self.grouping())?;
         let carets = selections.selections().iter().map(|selection| {
             let end = applied
                 .change_map
@@ -1857,19 +2429,33 @@ impl InputRouter {
                 button: MouseButton::Primary,
                 click_count,
             } => {
-                let row = surface
-                    .scroll
-                    .top_row
-                    .saturating_add((y / surface.geometry.line_height).floor() as usize);
+                let row = surface.scroll.top_row.saturating_add(
+                    (y.max(0.0) / surface.geometry.line_height.max(1.0)).floor() as usize,
+                );
                 if x < surface.gutter_width() {
-                    if let Some(gutter) = surface
-                        .display
-                        .gutter(4)
-                        .rows
-                        .iter()
-                        .find(|gutter| gutter.display_row == row)
-                    {
-                        surface.toggle_fold_at_line(gutter.buffer_line);
+                    if row >= surface.display.row_count() {
+                        return Ok(InputOutcome::handled());
+                    }
+                    let chevron_start = surface.gutter_width() - GUTTER_FOLD_WIDTH;
+                    if x >= chevron_start - GUTTER_NUMBER_PADDING {
+                        // Fold chevron column (and its padding): toggle.
+                        if let Some(gutter) = surface
+                            .display
+                            .gutter_for_display_range(GUTTER_MIN_DIGITS, row..row + 1)
+                            .rows
+                            .first()
+                        {
+                            surface.toggle_fold_at_line(gutter.buffer_line);
+                        }
+                    } else if x >= GUTTER_MARKER_WIDTH {
+                        // Line-number column: select the whole line.
+                        let line = surface.display.rows()[row].buffer_line;
+                        surface.select_line_at(line);
+                        self.drag_anchor = None;
+                        return Ok(InputOutcome {
+                            selection_changed: true,
+                            ..InputOutcome::handled()
+                        });
                     }
                     return Ok(InputOutcome::handled());
                 }
@@ -1892,6 +2478,23 @@ impl InputRouter {
                 }
                 self.drag_anchor = Some(byte);
                 surface.editor.set_selections(SelectionSet::caret(byte));
+                surface.invalidation.push(InvalidationKind::Selection, None);
+                Ok(InputOutcome {
+                    selection_changed: true,
+                    ..InputOutcome::handled()
+                })
+            }
+            MouseEvent::Extend { x, y } => {
+                let byte = mouse_to_byte(surface, x, y)?;
+                let anchor = surface
+                    .editor
+                    .selections()
+                    .primary()
+                    .map_or(byte, |selection| selection.anchor);
+                self.drag_anchor = Some(anchor);
+                surface
+                    .editor
+                    .set_selections(SelectionSet::new([Selection::range(anchor, byte)]));
                 surface.invalidation.push(InvalidationKind::Selection, None);
                 Ok(InputOutcome {
                     selection_changed: true,
@@ -1921,16 +2524,31 @@ impl InputRouter {
     }
 }
 
+/// Maps editor-local pointer coordinates to a byte offset. The pointer may be
+/// anywhere (outside the text, past a line's end, above or below the
+/// document); it clamps to the nearest valid caret position, exactly like a
+/// desktop editor. `x` is relative to the editor's left edge (gutter
+/// included) plus any sub-column scroll remainder; `y` is relative to the top
+/// of the first rendered row.
 fn mouse_to_byte(surface: &EditorSurface, x: f32, y: f32) -> Result<usize, SurfaceError> {
-    if x.is_sign_negative() || y.is_sign_negative() || surface.geometry.line_height <= 0.0 {
+    if !x.is_finite() || !y.is_finite() || surface.geometry.line_height <= 0.0 {
         return Err(SurfaceError::Input(InputError::InvalidMouseCoordinate));
+    }
+    let row_count = surface.display.row_count();
+    if row_count == 0 {
+        return Ok(0);
     }
     let row = surface
         .scroll
         .top_row
-        .saturating_add((y / surface.geometry.line_height).floor() as usize);
+        .saturating_add((y.max(0.0) / surface.geometry.line_height).floor() as usize)
+        .min(row_count - 1);
     let code_x = (x - surface.gutter_width() - CODE_PADDING).max(0.0);
-    let column = (code_x / surface.geometry.character_width.max(1.0)).floor() as usize;
+    // Round to the nearest column boundary so clicking the right half of a
+    // glyph places the caret after it.
+    let column = ((code_x / surface.geometry.character_width.max(1.0)) + 0.5).floor() as usize
+        + surface.scroll.horizontal_columns;
+    let column = column.min(surface.display.rows()[row].display_width);
     surface
         .display
         .display_to_buffer(DisplayPoint { row, column }, Affinity::Before)
@@ -1966,1065 +2584,6 @@ fn indent_guides_for_line(text: &str, start: usize, end: usize, tab_width: usize
         guides.push(guide);
     }
     guides
-}
-
-#[cfg(feature = "native-wgpui")]
-pub mod native {
-    use super::{
-        EditorSurface, InputEvent, InputRouter, Key, KeyEvent, KeyModifiers, MouseButton,
-        MouseEvent, RenderFrame, SurfaceColor, CODE_PADDING,
-    };
-    use mockaco_renderer::{
-        DIAGNOSTIC_ERROR_STYLE_ID, DIAGNOSTIC_HINT_STYLE_ID, DIAGNOSTIC_INFO_STYLE_ID,
-        DIAGNOSTIC_WARNING_STYLE_ID, SEARCH_CURRENT_MATCH_STYLE_ID, SEARCH_MATCH_STYLE_ID,
-    };
-    use wgpui::{
-        div, fill, font, point, px, size, ClipboardItem, Context, DispatchPhase, Element,
-        ElementId, Entity, FocusHandle, FontFallbacks, GlobalElementId, HighlightStyle,
-        InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseDownEvent,
-        MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollDelta, ScrollWheelEvent,
-        Size, StatefulInteractiveElement, Style, Styled, StyledText, Window,
-    };
-
-    /// Native WGPUI editor view backed by the framework-independent surface.
-    pub struct WgpuiEditorView {
-        pub surface: EditorSurface,
-        pub input_router: InputRouter,
-        pub read_only: bool,
-        focus_handle: Option<FocusHandle>,
-        dragging: bool,
-        scroll_remainder: f32,
-        scroll_animation: bool,
-        scrollbar_drag: Option<ScrollbarDrag>,
-    }
-
-    impl WgpuiEditorView {
-        pub fn new(surface: EditorSurface) -> Self {
-            Self {
-                surface,
-                input_router: InputRouter::default(),
-                read_only: false,
-                focus_handle: None,
-                dragging: false,
-                scroll_remainder: 0.0,
-                scroll_animation: false,
-                scrollbar_drag: None,
-            }
-        }
-
-        pub fn new_read_only(surface: EditorSurface) -> Self {
-            Self {
-                surface,
-                input_router: InputRouter::default(),
-                read_only: true,
-                focus_handle: None,
-                dragging: false,
-                scroll_remainder: 0.0,
-                scroll_animation: false,
-                scrollbar_drag: None,
-            }
-        }
-
-        pub fn render_frame(&self) -> RenderFrame {
-            self.surface.render_frame()
-        }
-
-        fn route(&mut self, event: InputEvent, cx: &mut Context<Self>) {
-            if self.read_only
-                && matches!(
-                    &event,
-                    InputEvent::Text(_)
-                        | InputEvent::Paste(_)
-                        | InputEvent::Key(_)
-                        | InputEvent::Ime(_)
-                )
-            {
-                return;
-            }
-            let is_scroll = matches!(&event, InputEvent::Scroll { .. });
-            let before_top = self.surface.scroll().top_row;
-            if let Ok(outcome) = self.input_router.route(&mut self.surface, event) {
-                if outcome.scroll_changed && !is_scroll {
-                    let after_top = self.surface.scroll().top_row;
-                    let delta = after_top as i64 - before_top as i64;
-                    if delta.abs() <= 1 && delta != 0 {
-                        self.scroll_remainder =
-                            -(delta as f32) * self.surface.geometry().line_height.max(1.0);
-                        self.scroll_animation = true;
-                    } else {
-                        self.scroll_remainder = 0.0;
-                        self.scroll_animation = false;
-                    }
-                }
-                cx.notify();
-            }
-        }
-
-        fn on_key_down(
-            &mut self,
-            event: &wgpui::KeyDownEvent,
-            _window: &mut Window,
-            cx: &mut Context<Self>,
-        ) {
-            let keystroke = &event.keystroke;
-            let modifiers = KeyModifiers {
-                shift: keystroke.modifiers.shift,
-                control: keystroke.modifiers.control,
-                alt: keystroke.modifiers.alt,
-                command: keystroke.modifiers.platform,
-            };
-            if modifiers.control || modifiers.command {
-                if let Some(key_char) = keystroke.key_char.as_deref() {
-                    if key_char.eq_ignore_ascii_case("c") {
-                        cx.write_to_clipboard(ClipboardItem::new_string(
-                            self.surface.clipboard_text(),
-                        ));
-                        cx.notify();
-                        return;
-                    }
-                    if key_char.eq_ignore_ascii_case("x") {
-                        if !self.read_only {
-                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                self.surface.clipboard_text(),
-                            ));
-                            self.route(
-                                InputEvent::Key(KeyEvent {
-                                    key: Key::Character("x".to_owned()),
-                                    modifiers,
-                                }),
-                                cx,
-                            );
-                        }
-                        return;
-                    }
-                    if key_char.eq_ignore_ascii_case("v") {
-                        if !self.read_only {
-                            if let Some(text) =
-                                cx.read_from_clipboard().and_then(|item| item.text())
-                            {
-                                self.route(InputEvent::Paste(text), cx);
-                            }
-                        }
-                        return;
-                    }
-                }
-            }
-            let key = match keystroke.key.as_str() {
-                "backspace" => Key::Backspace,
-                "delete" => Key::Delete,
-                "enter" => Key::Enter,
-                "tab" => Key::Tab,
-                "escape" => Key::Escape,
-                "left" => Key::Left,
-                "right" => Key::Right,
-                "up" => Key::Up,
-                "down" => Key::Down,
-                "pageup" => Key::PageUp,
-                "pagedown" => Key::PageDown,
-                "home" => Key::Home,
-                "end" => Key::End,
-                _ => keystroke
-                    .key_char
-                    .clone()
-                    .map(Key::Character)
-                    .unwrap_or_else(|| Key::Unsupported(keystroke.key.clone())),
-            };
-            self.route(InputEvent::Key(KeyEvent { key, modifiers }), cx);
-        }
-
-        fn begin_scrollbar_drag(&mut self, pointer_y: f32) {
-            self.scroll_animation = false;
-            let track_height = self.surface.geometry().height;
-            let Some(scrollbar) = scrollbar_geometry(self.surface.scroll(), track_height) else {
-                return;
-            };
-            let grab_offset = if (scrollbar.thumb_top
-                ..=scrollbar.thumb_top + scrollbar.thumb_height)
-                .contains(&pointer_y)
-            {
-                pointer_y - scrollbar.thumb_top
-            } else {
-                scrollbar.thumb_height * 0.5
-            };
-            self.scrollbar_drag = Some(ScrollbarDrag { grab_offset });
-            self.scrollbar_drag_to(pointer_y, ScrollbarDrag { grab_offset });
-        }
-
-        fn scrollbar_drag_to(&mut self, pointer_y: f32, drag: ScrollbarDrag) -> bool {
-            let track_height = self.surface.geometry().height;
-            let scroll = self.surface.scroll();
-            let Some(scrollbar) = scrollbar_geometry(scroll, track_height) else {
-                return false;
-            };
-            let row = scrollbar_row_for_position(
-                scroll,
-                track_height,
-                scrollbar.thumb_height,
-                pointer_y,
-                drag.grab_offset,
-            );
-            self.scroll_remainder = 0.0;
-            self.scroll_animation = false;
-            self.surface.scroll_to(row, scroll.horizontal_columns)
-        }
-
-        fn on_scroll(
-            &mut self,
-            event: &ScrollWheelEvent,
-            _window: &mut Window,
-            cx: &mut Context<Self>,
-        ) {
-            self.scroll_animation = false;
-            let geometry = self.surface.geometry();
-            let (vertical, horizontal) = match event.delta {
-                ScrollDelta::Lines(point) => {
-                    // Ordinary wheel devices report line notches. Keep those
-                    // notches fractional so the translated row layer can move
-                    // between line boundaries instead of snapping immediately.
-                    let (vertical, remainder) = fractional_line_scroll(
-                        self.scroll_remainder,
-                        -point.y,
-                        geometry.line_height,
-                    );
-                    self.scroll_remainder = remainder;
-                    (vertical, point.x.round() as isize)
-                }
-                ScrollDelta::Pixels(point) => {
-                    let total = self.scroll_remainder - point.y.as_f32();
-                    let vertical = (total / geometry.line_height.max(1.0)).trunc() as isize;
-                    self.scroll_remainder = total - vertical as f32 * geometry.line_height.max(1.0);
-                    (
-                        vertical,
-                        (point.x.as_f32() / geometry.character_width.max(1.0)).round() as isize,
-                    )
-                }
-            };
-            let scroll = self.surface.scroll();
-            let max_row = scroll.content_rows.saturating_sub(scroll.viewport_rows);
-            if (vertical < 0 && scroll.top_row == 0)
-                || (vertical > 0 && scroll.top_row >= max_row)
-                || (vertical == 0
-                    && ((self.scroll_remainder < 0.0 && scroll.top_row == 0)
-                        || (self.scroll_remainder > 0.0 && scroll.top_row >= max_row)))
-            {
-                self.scroll_remainder = 0.0;
-            }
-            self.route(
-                InputEvent::Scroll {
-                    vertical,
-                    horizontal,
-                },
-                cx,
-            );
-        }
-    }
-
-    fn fractional_line_scroll(remainder: f32, lines: f32, line_height: f32) -> (isize, f32) {
-        let line_height = line_height.max(1.0);
-        let total = remainder + lines * line_height * 0.45;
-        let vertical = (total / line_height).trunc() as isize;
-        (vertical, total - vertical as f32 * line_height)
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    struct ScrollbarGeometry {
-        thumb_top: f32,
-        thumb_height: f32,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    struct ScrollbarDrag {
-        grab_offset: f32,
-    }
-
-    struct EditorInputLayer {
-        editor: Entity<WgpuiEditorView>,
-        x_offset: f32,
-    }
-
-    impl EditorInputLayer {
-        fn new(editor: Entity<WgpuiEditorView>, x_offset: f32) -> Self {
-            Self { editor, x_offset }
-        }
-    }
-
-    impl IntoElement for EditorInputLayer {
-        type Element = Self;
-
-        fn into_element(self) -> Self::Element {
-            self
-        }
-    }
-
-    impl Element for EditorInputLayer {
-        type RequestLayoutState = ();
-        type PrepaintState = ();
-
-        fn id(&self) -> Option<ElementId> {
-            None
-        }
-
-        fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-            None
-        }
-
-        fn request_layout(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            window: &mut Window,
-            cx: &mut wgpui::App,
-        ) -> (LayoutId, Self::RequestLayoutState) {
-            let style = Style {
-                size: Size::full(),
-                ..Style::default()
-            };
-            (window.request_layout(style, [], cx), ())
-        }
-
-        fn prepaint(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            _bounds: wgpui::Bounds<Pixels>,
-            _request_layout: &mut Self::RequestLayoutState,
-            _window: &mut Window,
-            _cx: &mut wgpui::App,
-        ) -> Self::PrepaintState {
-        }
-
-        fn paint(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            bounds: wgpui::Bounds<Pixels>,
-            _request_layout: &mut Self::RequestLayoutState,
-            _prepaint: &mut Self::PrepaintState,
-            window: &mut Window,
-            _cx: &mut wgpui::App,
-        ) {
-            let editor = self.editor.clone();
-            let x_offset = self.x_offset;
-            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble
-                    || event.button != wgpui::MouseButton::Left
-                    || !bounds.contains(&event.position)
-                {
-                    return;
-                }
-                let (x, y) = local_mouse_point(bounds, event.position, x_offset);
-                cx.stop_propagation();
-                editor.update(cx, |view, cx| {
-                    view.dragging = true;
-                    if let Some(handle) = &view.focus_handle {
-                        window.focus(handle, cx);
-                    }
-                    view.route(
-                        InputEvent::Mouse(MouseEvent::Down {
-                            x,
-                            y: y + view.scroll_remainder,
-                            button: MouseButton::Primary,
-                            click_count: event.click_count,
-                        }),
-                        cx,
-                    );
-                });
-            });
-
-            let editor = self.editor.clone();
-            let x_offset = self.x_offset;
-            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
-                if phase != DispatchPhase::Bubble {
-                    return;
-                }
-                let dragging = event.dragging();
-                let (x, y) = local_mouse_point(bounds, event.position, x_offset);
-                let mut handled = false;
-                editor.update(cx, |view, cx| {
-                    if view.scrollbar_drag.is_none() && (view.dragging || dragging) {
-                        handled = true;
-                        view.route(
-                            InputEvent::Mouse(MouseEvent::Drag {
-                                x,
-                                y: y + view.scroll_remainder,
-                            }),
-                            cx,
-                        );
-                    }
-                });
-                if handled {
-                    cx.stop_propagation();
-                }
-            });
-
-            let editor = self.editor.clone();
-            window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
-                if phase != DispatchPhase::Bubble || event.button != wgpui::MouseButton::Left {
-                    return;
-                }
-                let mut handled = false;
-                editor.update(cx, |view, cx| {
-                    if view.dragging {
-                        handled = true;
-                        view.dragging = false;
-                        view.route(
-                            InputEvent::Mouse(MouseEvent::Up {
-                                x: 0.0,
-                                y: 0.0,
-                                button: MouseButton::Primary,
-                            }),
-                            cx,
-                        );
-                    }
-                });
-                if handled {
-                    cx.stop_propagation();
-                }
-            });
-        }
-    }
-
-    fn local_mouse_point(
-        bounds: wgpui::Bounds<Pixels>,
-        position: wgpui::Point<Pixels>,
-        x_offset: f32,
-    ) -> (f32, f32) {
-        let local_x = (position.x - bounds.origin.x)
-            .as_f32()
-            .clamp(0.0, bounds.size.width.as_f32());
-        (
-            local_x + x_offset,
-            (position.y - bounds.origin.y)
-                .as_f32()
-                .clamp(0.0, bounds.size.height.as_f32()),
-        )
-    }
-
-    struct EditorScrollbar {
-        editor: Entity<WgpuiEditorView>,
-        track_height: f32,
-        scrollbar: ScrollbarGeometry,
-    }
-
-    impl EditorScrollbar {
-        fn new(
-            editor: Entity<WgpuiEditorView>,
-            track_height: f32,
-            scrollbar: ScrollbarGeometry,
-        ) -> Self {
-            Self {
-                editor,
-                track_height,
-                scrollbar,
-            }
-        }
-    }
-
-    impl IntoElement for EditorScrollbar {
-        type Element = Self;
-
-        fn into_element(self) -> Self::Element {
-            self
-        }
-    }
-
-    impl Element for EditorScrollbar {
-        type RequestLayoutState = ();
-        type PrepaintState = ();
-
-        fn id(&self) -> Option<ElementId> {
-            None
-        }
-
-        fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-            None
-        }
-
-        fn request_layout(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            window: &mut Window,
-            cx: &mut wgpui::App,
-        ) -> (LayoutId, Self::RequestLayoutState) {
-            let style = Style {
-                size: size(px(8.0).into(), px(self.track_height).into()),
-                ..Style::default()
-            };
-            (window.request_layout(style, [], cx), ())
-        }
-
-        fn prepaint(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            _bounds: wgpui::Bounds<Pixels>,
-            _request_layout: &mut Self::RequestLayoutState,
-            _window: &mut Window,
-            _cx: &mut wgpui::App,
-        ) -> Self::PrepaintState {
-        }
-
-        fn paint(
-            &mut self,
-            _id: Option<&GlobalElementId>,
-            _inspector_id: Option<&InspectorElementId>,
-            bounds: wgpui::Bounds<Pixels>,
-            _request_layout: &mut Self::RequestLayoutState,
-            _prepaint: &mut Self::PrepaintState,
-            window: &mut Window,
-            _cx: &mut wgpui::App,
-        ) {
-            window.paint_quad(fill(bounds, color(SurfaceColor::rgba(13, 20, 32, 80))));
-            window.paint_quad(
-                fill(
-                    wgpui::Bounds {
-                        origin: point(
-                            bounds.origin.x,
-                            bounds.origin.y + px(self.scrollbar.thumb_top),
-                        ),
-                        size: size(bounds.size.width, px(self.scrollbar.thumb_height)),
-                    },
-                    color(SurfaceColor::rgba(122, 151, 187, 190)),
-                )
-                .corner_radii(wgpui::Corners::all(px(3.0))),
-            );
-
-            let editor = self.editor.clone();
-            window.on_mouse_event(move |event: &MouseDownEvent, phase, _window, cx| {
-                if phase != DispatchPhase::Bubble || event.button != wgpui::MouseButton::Left {
-                    return;
-                }
-                let pointer_y = (event.position.y - bounds.origin.y).as_f32();
-                if !bounds.contains(&event.position) {
-                    return;
-                }
-                cx.stop_propagation();
-                editor.update(cx, |view, cx| {
-                    view.begin_scrollbar_drag(pointer_y);
-                    cx.notify();
-                });
-            });
-
-            let editor = self.editor.clone();
-            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
-                if phase != DispatchPhase::Bubble {
-                    return;
-                }
-                let pointer_y = (event.position.y - bounds.origin.y).as_f32();
-                let mut changed = false;
-                editor.update(cx, |view, cx| {
-                    if let Some(drag) = view.scrollbar_drag {
-                        changed = view.scrollbar_drag_to(pointer_y, drag);
-                        if changed {
-                            cx.notify();
-                        }
-                    }
-                });
-                if changed {
-                    cx.stop_propagation();
-                }
-            });
-
-            let editor = self.editor.clone();
-            window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
-                if phase != DispatchPhase::Bubble || event.button != wgpui::MouseButton::Left {
-                    return;
-                }
-                let mut stopped = false;
-                editor.update(cx, |view, _cx| {
-                    if view.scrollbar_drag.take().is_some() {
-                        view.scroll_remainder = 0.0;
-                        stopped = true;
-                    }
-                });
-                if stopped {
-                    cx.stop_propagation();
-                }
-            });
-        }
-    }
-
-    fn scrollbar_geometry(
-        scroll: super::ScrollState,
-        track_height: f32,
-    ) -> Option<ScrollbarGeometry> {
-        if scroll.content_rows <= scroll.viewport_rows || track_height <= 0.0 {
-            return None;
-        }
-        let track_height = track_height.max(1.0);
-        let ratio = scroll.viewport_rows as f32 / scroll.content_rows as f32;
-        let thumb_height = (track_height * ratio).clamp(28.0, track_height);
-        let travel = (track_height - thumb_height).max(0.0);
-        let max_top = scroll.content_rows.saturating_sub(scroll.viewport_rows);
-        let thumb_top = if max_top == 0 {
-            0.0
-        } else {
-            travel * scroll.top_row.min(max_top) as f32 / max_top as f32
-        };
-        Some(ScrollbarGeometry {
-            thumb_top,
-            thumb_height,
-        })
-    }
-
-    fn scrollbar_row_for_position(
-        scroll: super::ScrollState,
-        track_height: f32,
-        thumb_height: f32,
-        pointer_y: f32,
-        grab_offset: f32,
-    ) -> usize {
-        let travel = (track_height - thumb_height).max(0.0);
-        let max_row = scroll.content_rows.saturating_sub(scroll.viewport_rows);
-        if travel <= 0.0 || max_row == 0 {
-            return 0;
-        }
-        let thumb_top = (pointer_y - grab_offset).clamp(0.0, travel);
-        ((thumb_top / travel) * max_row as f32).round() as usize
-    }
-
-    impl Render for WgpuiEditorView {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            if self.scroll_animation {
-                self.scroll_remainder *= 0.72;
-                if self.scroll_remainder.abs() < 0.25 {
-                    self.scroll_remainder = 0.0;
-                    self.scroll_animation = false;
-                } else {
-                    window.request_animation_frame();
-                }
-            }
-            if self.focus_handle.is_none() {
-                self.focus_handle = Some(cx.focus_handle());
-            }
-            let editor_font = editor_font();
-            let mut geometry = self.surface.geometry();
-            let font_id = window.text_system().resolve_font(&editor_font);
-            if let Ok(width) = window.text_system().ch_advance(font_id, px(14.0)) {
-                let measured_width = width.as_f32();
-                if measured_width.is_finite()
-                    && measured_width > 0.0
-                    && (measured_width - geometry.character_width).abs() > 0.05
-                {
-                    geometry.character_width = measured_width;
-                    geometry.gutter_character_width = measured_width;
-                    self.surface.set_geometry(geometry);
-                }
-            }
-            let viewport_rows = (geometry.height / geometry.line_height.max(1.0)).floor() as usize;
-            if self.surface.scroll().viewport_rows <= viewport_rows {
-                self.surface.set_viewport(
-                    viewport_rows.saturating_add(1),
-                    self.surface.scroll().viewport_columns,
-                );
-            }
-            let frame = self.surface.render_frame_with_buffer(1);
-            geometry = self.surface.geometry();
-            let gutter_width = self.surface.gutter_width();
-            let code_padding = CODE_PADDING;
-            let theme = frame.theme;
-            let root = div()
-                .flex()
-                .flex_col()
-                .size_full()
-                .bg(color(theme.background))
-                .text_color(color(theme.foreground))
-                .font(editor_font.clone())
-                .text_size(px(14.0))
-                .line_height(px(geometry.line_height))
-                .track_focus(self.focus_handle.as_ref().unwrap())
-                .on_key_down(cx.listener(Self::on_key_down))
-                .on_scroll_wheel(cx.listener(Self::on_scroll));
-            let mut row_stack = div()
-                .flex()
-                .flex_col()
-                .relative()
-                .top(px(-self.scroll_remainder));
-            for row in frame.rows {
-                let gutter = frame
-                    .gutter
-                    .rows
-                    .iter()
-                    .find(|gutter| gutter.display_row == row.display_row);
-                let gutter_marker = frame
-                    .decoration_geometry
-                    .iter()
-                    .find(|decoration| decoration.display_row == row.display_row)
-                    .map(|decoration| {
-                        let color = match decoration.style.id {
-                            DIAGNOSTIC_ERROR_STYLE_ID => SurfaceColor::rgba(248, 113, 113, 255),
-                            DIAGNOSTIC_WARNING_STYLE_ID => SurfaceColor::rgba(251, 191, 36, 255),
-                            DIAGNOSTIC_INFO_STYLE_ID | DIAGNOSTIC_HINT_STYLE_ID => {
-                                SurfaceColor::rgba(96, 165, 250, 255)
-                            }
-                            SEARCH_CURRENT_MATCH_STYLE_ID | SEARCH_MATCH_STYLE_ID => {
-                                SurfaceColor::rgba(192, 132, 252, 255)
-                            }
-                            _ => SurfaceColor::rgba(125, 151, 184, 255),
-                        };
-                        ("●", color)
-                    });
-                let mut code = div()
-                    .relative()
-                    .flex_1()
-                    .h(px(row.height))
-                    .pl(px(code_padding))
-                    .pr(px(code_padding))
-                    .font(editor_font.clone())
-                    .bg(color(if row.active {
-                        theme.active_line
-                    } else {
-                        theme.background
-                    }))
-                    .whitespace_nowrap();
-                for guide in &row.indent_guides {
-                    code = code.child(
-                        div()
-                            .absolute()
-                            .left(px(
-                                code_padding + *guide as f32 * geometry.character_width - 0.5
-                            ))
-                            .top(px(0.0))
-                            .w(px(1.0))
-                            .h(px(row.height))
-                            .bg(color(SurfaceColor::rgba(57, 72, 96, 150))),
-                    );
-                }
-                for selection in frame
-                    .selections
-                    .iter()
-                    .filter(|selection| selection.display_row == row.display_row)
-                {
-                    code = code.child(
-                        div()
-                            .absolute()
-                            .left(px(selection.x + code_padding))
-                            .top(px(selection.y - row.y))
-                            .w(px(selection.width.max(1.0)))
-                            .h(px(selection.height))
-                            .bg(color(if selection.primary {
-                                theme.primary_selection
-                            } else {
-                                theme.selection
-                            })),
-                    );
-                }
-                for decoration in frame
-                    .decoration_geometry
-                    .iter()
-                    .filter(|decoration| decoration.display_row == row.display_row)
-                {
-                    code = code.child(
-                        div()
-                            .absolute()
-                            .left(px(decoration.x + code_padding))
-                            .top(px(decoration.y - row.y))
-                            .w(px(decoration.width.max(1.0)))
-                            .h(px(decoration.height))
-                            .border_b_1()
-                            .border_color(color(decoration_color(&theme, decoration.style.id))),
-                    );
-                }
-                let highlights = row.tokens.iter().filter_map(|token| {
-                    let start = token.range.start.max(row.source_range.start);
-                    let end = token.range.end.min(row.source_range.end);
-                    token.style.map(|style| {
-                        (
-                            start - row.source_range.start..end - row.source_range.start,
-                            HighlightStyle {
-                                color: Some(color(SurfaceColor::rgba(
-                                    style.foreground.red,
-                                    style.foreground.green,
-                                    style.foreground.blue,
-                                    style.foreground.alpha,
-                                ))),
-                                ..HighlightStyle::default()
-                            },
-                        )
-                    })
-                });
-                code = code.child(StyledText::new(row.text.clone()).with_highlights(highlights));
-                for caret in frame
-                    .carets
-                    .iter()
-                    .filter(|caret| caret.display_row == row.display_row)
-                {
-                    code = code.child(
-                        div()
-                            .absolute()
-                            .left(px(caret.x + code_padding))
-                            .top(px(caret.y - row.y))
-                            .w(px(if caret.primary { 2.0 } else { 1.0 }))
-                            .h(px(caret.height))
-                            .bg(color(theme.caret)),
-                    );
-                }
-                row_stack = row_stack.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .h(px(row.height))
-                        .child(
-                            div()
-                                .h(px(row.height))
-                                .w(px(gutter_width))
-                                .bg(color(theme.background))
-                                .font(editor_font.clone())
-                                .text_size(px(13.0))
-                                .border_r_1()
-                                .border_color(color(theme.background))
-                                .hover(|style| {
-                                    style.border_color(color(SurfaceColor::rgba(77, 104, 137, 255)))
-                                })
-                                .text_color(color(if row.active {
-                                    theme.foreground
-                                } else {
-                                    theme.gutter_foreground
-                                }))
-                                .whitespace_nowrap()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .justify_end()
-                                        .child(
-                                            div()
-                                                .w(px(10.0))
-                                                .text_center()
-                                                .text_color(color(
-                                                    gutter_marker
-                                                        .map(|(_, color)| color)
-                                                        .unwrap_or(SurfaceColor::rgba(0, 0, 0, 0)),
-                                                ))
-                                                .child(
-                                                    gutter_marker
-                                                        .map(|(marker, _)| marker)
-                                                        .unwrap_or(" "),
-                                                ),
-                                        )
-                                        .child({
-                                            let fold_line = gutter
-                                                .filter(|gutter| gutter.foldable)
-                                                .map(|gutter| gutter.buffer_line);
-                                            div()
-                                                .w(px(14.0))
-                                                .text_center()
-                                                .text_color(color(SurfaceColor::rgba(
-                                                    125, 151, 184, 255,
-                                                )))
-                                                .child(
-                                                    if gutter
-                                                        .map(|gutter| gutter.foldable)
-                                                        .unwrap_or(false)
-                                                    {
-                                                        if gutter
-                                                            .map(|gutter| gutter.folded)
-                                                            .unwrap_or(false)
-                                                        {
-                                                            "›"
-                                                        } else {
-                                                            "⌄"
-                                                        }
-                                                    } else {
-                                                        " "
-                                                    },
-                                                )
-                                                .id(format!(
-                                                    "fold-toggle-{}",
-                                                    fold_line.unwrap_or(usize::MAX)
-                                                ))
-                                                .cursor_pointer()
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    if let Some(line) = fold_line {
-                                                        this.surface.toggle_fold_at_line(line);
-                                                        cx.notify();
-                                                    }
-                                                }))
-                                        })
-                                        .child(
-                                            div()
-                                                .w(px(frame.gutter.line_number_width as f32
-                                                    * geometry.gutter_character_width))
-                                                .text_right()
-                                                .child(format!(
-                                                    "{}",
-                                                    gutter
-                                                        .map(|gutter| gutter.line_number)
-                                                        .unwrap_or(0)
-                                                )),
-                                        ),
-                                ),
-                        )
-                        .child(code),
-                );
-            }
-            // Keep the clip rectangle in a fixed-size sibling wrapper. The
-            // translated stack is deliberately larger than this wrapper so
-            // its one-row presentation buffer can never paint outside the
-            // editor viewport.
-            let rows = div()
-                .flex_1()
-                .h(px(geometry.height))
-                .overflow_hidden()
-                .relative()
-                .child(row_stack);
-            let mut rows = rows;
-            rows = rows.child(
-                div()
-                    .absolute()
-                    .top(px(0.0))
-                    .left(px(gutter_width))
-                    .right(px(16.0))
-                    .bottom(px(0.0))
-                    .child(EditorInputLayer::new(cx.entity(), gutter_width)),
-            );
-            if let Some(scrollbar) = scrollbar_geometry(self.surface.scroll(), geometry.height) {
-                rows = rows.child(
-                    div()
-                        .absolute()
-                        .top(px(0.0))
-                        .right(px(4.0))
-                        .w(px(8.0))
-                        .h(px(geometry.height))
-                        .cursor_pointer()
-                        .child(EditorScrollbar::new(
-                            cx.entity(),
-                            geometry.height,
-                            scrollbar,
-                        )),
-                );
-            }
-            root.child(rows)
-        }
-    }
-
-    fn editor_font() -> wgpui::Font {
-        let mut font = font("JetBrains Mono");
-        font.fallbacks = Some(FontFallbacks::from_fonts(vec![
-            "Cascadia Mono".to_owned(),
-            "Consolas".to_owned(),
-            "monospace".to_owned(),
-        ]));
-        font
-    }
-
-    fn color(color: SurfaceColor) -> wgpui::Hsla {
-        wgpui::Rgba {
-            r: f32::from(color.red) / 255.0,
-            g: f32::from(color.green) / 255.0,
-            b: f32::from(color.blue) / 255.0,
-            a: f32::from(color.alpha) / 255.0,
-        }
-        .into()
-    }
-
-    fn decoration_color(theme: &super::SurfaceTheme, style_id: u32) -> SurfaceColor {
-        match style_id {
-            SEARCH_MATCH_STYLE_ID => theme.selection,
-            SEARCH_CURRENT_MATCH_STYLE_ID => theme.primary_selection,
-            DIAGNOSTIC_ERROR_STYLE_ID => SurfaceColor::rgba(220, 80, 80, 255),
-            DIAGNOSTIC_WARNING_STYLE_ID => SurfaceColor::rgba(220, 170, 70, 255),
-            DIAGNOSTIC_INFO_STYLE_ID => SurfaceColor::rgba(80, 150, 220, 255),
-            DIAGNOSTIC_HINT_STYLE_ID => SurfaceColor::rgba(120, 190, 140, 255),
-            _ => theme.decoration,
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use mockaco_renderer::{DisplayConfig, FoldRegion};
-
-        #[test]
-        fn native_presentation_keeps_gutter_and_code_geometry_aligned() {
-            let surface = EditorSurface::new(
-                "fn main() {\n    // visible\n    let value = 7;\n}\n",
-                DisplayConfig::unwrapped(),
-                Default::default(),
-            );
-            let frame = surface.render_frame();
-            assert!(surface.gutter_width() >= 10.0);
-            assert_eq!(frame.gutter.rows.len(), frame.rows.len());
-            assert!(frame.gutter.rows.iter().any(|row| row.foldable));
-            assert!(frame.rows.iter().any(|row| !row.tokens.is_empty()));
-        }
-
-        #[test]
-        fn native_presentation_exposes_fold_marker_and_active_selection_contrast() {
-            let mut surface = EditorSurface::new(
-                "fn main() {\n    let value = 7;\n}\n",
-                DisplayConfig::unwrapped(),
-                Default::default(),
-            );
-            surface.set_folds(mockaco_renderer::FoldSet::with_foldable(
-                [FoldRegion::new(0, 3)],
-                [FoldRegion::new(0, 3)],
-            ));
-            let frame = surface.render_frame();
-            assert!(frame.gutter.rows[0].folded);
-            assert_ne!(frame.theme.active_line, frame.theme.background);
-            assert_ne!(frame.theme.primary_selection, frame.theme.background);
-        }
-
-        #[test]
-        fn line_wheel_scroll_keeps_a_fractional_visual_remainder() {
-            let (rows, remainder) = fractional_line_scroll(0.0, -1.0, 20.0);
-            assert_eq!(rows, 0);
-            assert!((remainder + 9.0).abs() < f32::EPSILON);
-
-            let (rows, remainder) = fractional_line_scroll(remainder, -1.0, 20.0);
-            assert_eq!(rows, 0);
-            assert!((remainder + 18.0).abs() < f32::EPSILON);
-        }
-
-        #[test]
-        fn scrollbar_thumb_tracks_logical_scroll_and_has_a_minimum_size() {
-            let mut scroll = crate::ScrollState::default();
-            scroll.set_viewport(10, 80);
-            scroll.set_content_with_bottom_padding(100, 80, 1);
-            let top = scrollbar_geometry(scroll, 400.0).expect("scrollbar is visible");
-            scroll.scroll_to(usize::MAX, 0);
-            let bottom = scrollbar_geometry(scroll, 400.0).expect("scrollbar is visible");
-
-            assert!(top.thumb_height >= 28.0);
-            assert!(bottom.thumb_top > top.thumb_top);
-            assert!(bottom.thumb_top + bottom.thumb_height <= 400.0);
-            assert!(scrollbar_geometry(scroll, 0.0).is_none());
-        }
-
-        #[test]
-        fn scrollbar_track_positions_map_to_document_rows() {
-            let mut scroll = crate::ScrollState::default();
-            scroll.set_viewport(10, 80);
-            scroll.set_content_with_bottom_padding(100, 80, 1);
-            let geometry = scrollbar_geometry(scroll, 400.0).unwrap();
-
-            let middle = scrollbar_row_for_position(
-                scroll,
-                400.0,
-                geometry.thumb_height,
-                200.0,
-                geometry.thumb_height * 0.5,
-            );
-            let bottom =
-                scrollbar_row_for_position(scroll, 400.0, geometry.thumb_height, 400.0, 0.0);
-            assert!(middle > 40 && middle < 60);
-            assert_eq!(bottom, scroll.content_rows - scroll.viewport_rows);
-        }
-
-        #[test]
-        fn window_mouse_positions_are_translated_from_hitbox_bounds() {
-            let bounds = wgpui::Bounds {
-                origin: point(px(100.0), px(200.0)),
-                size: size(px(400.0), px(300.0)),
-            };
-            assert_eq!(
-                local_mouse_point(bounds, point(px(140.0), px(240.0)), 56.0),
-                (96.0, 40.0)
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3083,7 +2642,12 @@ mod tests {
     #[test]
     fn bottom_scroll_padding_allows_the_last_line_to_clear_the_edge() {
         let mut surface = surface("a\nb\nc\nd");
-        surface.set_viewport(2, 20);
+        // Two-row viewport: the final line may scroll up to the top edge, so
+        // (viewport - 1) presentation rows are reserved after the content.
+        let mut geometry = surface.geometry();
+        geometry.height = 40.0;
+        surface.set_geometry(geometry);
+        assert_eq!(surface.scroll().viewport_rows, 2);
         assert_eq!(
             surface.scroll().content_rows,
             surface.display().row_count() + 1
@@ -3342,13 +2906,15 @@ mod tests {
             DisplayConfig::unwrapped(),
             SurfaceGeometry::default(),
         );
-        assert!(surface.display().gutter(4).rows[0].foldable);
+        assert!(surface.display().gutter(GUTTER_MIN_DIGITS).rows[0].foldable);
+        let chevron_x = surface.gutter_width() - 4.0;
         let mut router = InputRouter::default();
         router
             .route(
                 &mut surface,
                 InputEvent::Mouse(MouseEvent::Down {
-                    x: 4.0,
+                    // Inside the fold-chevron column at the gutter's edge.
+                    x: chevron_x,
                     y: 0.0,
                     button: MouseButton::Primary,
                     click_count: 1,
@@ -3356,7 +2922,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(surface.display().row_count(), 2);
-        assert!(surface.display().gutter(4).rows[0].folded);
+        assert!(surface.display().gutter(GUTTER_MIN_DIGITS).rows[0].folded);
         router
             .route(
                 &mut surface,
@@ -3369,7 +2935,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        assert!(!surface.display().gutter(4).rows.is_empty());
+        assert!(!surface.display().gutter(GUTTER_MIN_DIGITS).rows.is_empty());
     }
 
     #[test]
@@ -3401,7 +2967,9 @@ mod tests {
         assert!(frame.rows.len() <= 22);
         assert_eq!(frame.rows.len(), frame.gutter.rows.len());
         assert!(frame.rows.iter().any(|row| !row.tokens.is_empty()));
-        assert!(surface.highlights.tokens().len() < 1_000);
+        // Only the padded viewport window is highlighted, never the whole
+        // 40k-line document (which would hold hundreds of thousands).
+        assert!(surface.highlights.tokens().len() < 3_000);
         assert!(frame.decorations.iter().all(|decoration| frame
             .rows
             .iter()
@@ -3462,11 +3030,13 @@ mod tests {
             SurfaceGeometry::default(),
         );
         let mut router = InputRouter::default();
+        // One full column into the text area (rounds to column 1).
+        let x = surface.gutter_width() + CODE_PADDING + surface.geometry().character_width;
         router
             .route(
                 &mut surface,
                 InputEvent::Mouse(MouseEvent::Down {
-                    x: 76.0,
+                    x,
                     y: 0.0,
                     button: MouseButton::Primary,
                     click_count: 1,
@@ -3476,7 +3046,7 @@ mod tests {
         router
             .route(
                 &mut surface,
-                InputEvent::Mouse(MouseEvent::Drag { x: 76.0, y: 20.0 }),
+                InputEvent::Mouse(MouseEvent::Drag { x, y: 20.0 }),
             )
             .unwrap();
         assert_eq!(

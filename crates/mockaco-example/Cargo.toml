@@ -14,7 +14,9 @@ mockaco-diff = { path = "../mockaco-diff" }
 mockaco-gpui = { path = "../mockaco-gpui" }
 mockaco-lsp = { path = "../mockaco-lsp" }
 mockaco-renderer = { path = "../mockaco-renderer" }
-wgpui = { version = "0.3.6", optional = true }
+# The native view targets the same WGPUI (gpui-ce) tree Pulsar builds against;
+# hosts that patch that git source (as Pulsar does) get one shared copy.
+wgpui = { package = "gpui-ce", git = "https://github.com/Far-Beyond-Pulsar/WGPUI", optional = true }
 
 [lib]
 path = "src/lib.rs"

@@ -52,18 +52,21 @@ impl Showcase {
                 .max_line_scan_bytes(512),
         ));
         let state = DemoState::new();
-        let editor = cx.new(|_| {
-            WgpuiEditorView::new(EditorSurface::new(DEMO_SOURCE, config.clone(), geometry))
+        let editor = cx.new(|cx| {
+            WgpuiEditorView::new(
+                EditorSurface::new(DEMO_SOURCE, config.clone(), geometry),
+                cx,
+            )
         });
-        let diff_original = cx.new(|_| {
-            WgpuiEditorView::new_read_only(EditorSurface::new(
-                DEMO_SOURCE,
-                config.clone(),
-                geometry,
-            ))
+        let diff_original = cx.new(|cx| {
+            WgpuiEditorView::new_read_only(
+                EditorSurface::new(DEMO_SOURCE, config.clone(), geometry),
+                cx,
+            )
         });
-        let diff_modified =
-            cx.new(|_| WgpuiEditorView::new(EditorSurface::new(MODIFIED_SOURCE, config, geometry)));
+        let diff_modified = cx.new(|cx| {
+            WgpuiEditorView::new(EditorSurface::new(MODIFIED_SOURCE, config, geometry), cx)
+        });
         let original = Document::new(DEMO_SOURCE).snapshot();
         let diff_contract = DiffEditor::new(&original, MODIFIED_SOURCE);
         Self {
