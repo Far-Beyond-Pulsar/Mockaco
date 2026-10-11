@@ -6,9 +6,11 @@
 
 use crate::{PaintRow, SurfaceColor};
 
-/// Exponential smoothing rate (1/seconds). Higher is snappier; this settles in
-/// roughly a tenth of a second, which reads as smooth without feeling laggy.
-const SMOOTH_RATE: f32 = 22.0;
+/// Exponential smoothing rate (1/seconds) for mouse-wheel notches. At 45 the
+/// view covers 90% of a notch in ~50 ms (three frames at 60 Hz): it reads as
+/// motion rather than a jump, without trailing behind the wheel. Scrollbar
+/// drags, minimap drags and touchpads bypass it and track the pointer 1:1.
+const SMOOTH_RATE: f32 = 45.0;
 /// Distance (px) below which an animation snaps to its target.
 const SNAP_DISTANCE: f32 = 0.2;
 
@@ -141,44 +143,15 @@ pub struct MinimapRun {
     pub tone: MinimapTone,
 }
 
-/// Per-line colored run summary of a document, built once per version.
-#[derive(Debug, Clone, Default)]
-pub struct Minimap {
-    version: Option<u64>,
-    spans: Vec<(u32, u32)>,
-    runs: Vec<MinimapRun>,
-}
-
-impl Minimap {
-    pub fn build(version: u64, text: &str, line_comment: Option<&str>) -> Self {
-        let mut spans = Vec::new();
-        let mut runs: Vec<MinimapRun> = Vec::new();
-        for line in text.split('\n') {
-            let first = runs.len() as u32;
-            line_runs(line, line_comment, &mut runs);
-            spans.push((first, runs.len() as u32));
-        }
-        Self {
-            version: Some(version),
-            spans,
-            runs,
-        }
-    }
-
-    pub fn is_current(&self, version: u64) -> bool {
-        self.version == Some(version)
-    }
-
-    pub fn line_count(&self) -> usize {
-        self.spans.len()
-    }
-
-    pub fn line(&self, line: usize) -> &[MinimapRun] {
-        match self.spans.get(line) {
-            Some((start, end)) => &self.runs[*start as usize..*end as usize],
-            None => &[],
-        }
-    }
+/// The colored runs of one source line, as the minimap draws it.
+///
+/// The minimap asks for the lines it shows each frame (a few hundred at
+/// most), so it never scans the document: its cost is the same for ten lines
+/// as for ten million.
+pub fn minimap_line(line: &str, line_comment: Option<&str>) -> Vec<MinimapRun> {
+    let mut runs = Vec::new();
+    line_runs(line, line_comment, &mut runs);
+    runs
 }
 
 fn line_runs(line: &str, line_comment: Option<&str>, runs: &mut Vec<MinimapRun>) {
@@ -213,7 +186,11 @@ fn line_runs(line: &str, line_comment: Option<&str>, runs: &mut Vec<MinimapRun>)
             && line_comment.is_some_and(|prefix| line[offset..].starts_with(prefix))
         {
             flush(&mut current, runs);
-            let remaining = line[offset..].trim_end().chars().count();
+            let remaining = line[offset..]
+                .trim_end()
+                .chars()
+                .take(MINIMAP_MAX_COLUMNS)
+                .count();
             let len = remaining.min(MINIMAP_MAX_COLUMNS - column);
             runs.push(MinimapRun {
                 start: column as u16,
@@ -382,20 +359,15 @@ mod tests {
 
     #[test]
     fn minimap_runs_classify_tones_and_comments() {
-        let map = Minimap::build(
-            3,
-            "let x = \"hi\"; // note\n    // all comment\n42 + y\n",
-            Some("//"),
-        );
-        assert!(map.is_current(3));
-        assert_eq!(map.line_count(), 4);
-        let first = map.line(0);
+        let line = |text: &str| minimap_line(text, Some("//"));
+        let first = line("let x = \"hi\"; // note");
         assert!(first.iter().any(|run| run.tone == MinimapTone::String));
         assert_eq!(first.last().unwrap().tone, MinimapTone::Comment);
-        assert_eq!(map.line(1)[0].tone, MinimapTone::Comment);
-        assert_eq!(map.line(1)[0].start, 4);
-        assert_eq!(map.line(2)[0].tone, MinimapTone::Number);
-        assert!(map.line(99).is_empty());
+        let comment = line("    // all comment");
+        assert_eq!(comment[0].tone, MinimapTone::Comment);
+        assert_eq!(comment[0].start, 4);
+        assert_eq!(line("42 + y")[0].tone, MinimapTone::Number);
+        assert!(line("").is_empty());
     }
 
     #[test]

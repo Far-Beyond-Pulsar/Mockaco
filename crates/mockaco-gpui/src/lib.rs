@@ -13,9 +13,9 @@ use mockaco_diff::{
     DiffSide,
 };
 use mockaco_language::{
-    FoldRange, FoldingProvider, FontStyle, GenericSyntaxProvider, HighlightResult,
-    IncrementalHighlights, LanguageError, LanguageSyntax, Rgba, RustTreeSitterProvider,
-    SyntaxHighlightProvider, Theme, TokenKind, TokenStyle,
+    FontStyle, GenericSyntaxProvider,
+    IncrementalHighlights, LanguageSyntax, Rgba, RustTreeSitterProvider,
+    Theme, TokenKind, TokenStyle,
 };
 use mockaco_renderer::{
     diagnostic_decorations, search_decorations, Decoration, DisplayMap, DisplayMapError,
@@ -25,6 +25,8 @@ use std::fmt;
 use std::ops::Range;
 
 pub mod chrome;
+mod language_worker;
+use language_worker::{LanguageWorker, Outcome, Provider};
 #[cfg(feature = "native-wgpui")]
 pub mod native;
 
@@ -80,47 +82,19 @@ impl PartialEq for Language {
 
 impl Eq for Language {}
 
-#[derive(Debug)]
-enum Highlighter {
-    Plain,
-    Rust(RustTreeSitterProvider),
-    Generic(GenericSyntaxProvider),
-}
-
-impl Highlighter {
-    fn new(language: Language) -> Self {
-        match language {
-            Language::Plain => Self::Plain,
-            Language::Rust => {
-                Self::Rust(RustTreeSitterProvider::new().expect("Rust Tree-sitter provider loads"))
-            }
-            Language::Syntax(syntax) => Self::Generic(GenericSyntaxProvider::new(syntax)),
+/// The worker that highlights and folds this surface's language, or `None`
+/// for plain text.
+fn language_worker(language: Language) -> Option<LanguageWorker> {
+    let provider = match language {
+        Language::Plain => return None,
+        Language::Rust => Provider::Rust(std::sync::Arc::new(
+            RustTreeSitterProvider::new().expect("Rust Tree-sitter provider loads"),
+        )),
+        Language::Syntax(syntax) => {
+            Provider::Generic(std::sync::Arc::new(GenericSyntaxProvider::new(syntax)))
         }
-    }
-
-    fn highlight(
-        &self,
-        snapshot: &DocumentSnapshot,
-        range: Range<usize>,
-    ) -> Result<HighlightResult, LanguageError> {
-        match self {
-            Self::Plain => Err(LanguageError::Provider("plain text".into())),
-            Self::Rust(provider) => provider.highlight(snapshot, range),
-            Self::Generic(provider) => provider.highlight(snapshot, range),
-        }
-    }
-
-    fn fold_ranges(
-        &self,
-        snapshot: &DocumentSnapshot,
-        range: Range<usize>,
-    ) -> Result<Vec<FoldRange>, LanguageError> {
-        match self {
-            Self::Plain => Ok(Vec::new()),
-            Self::Rust(provider) => provider.fold_ranges(snapshot, range),
-            Self::Generic(provider) => provider.fold_ranges(snapshot, range),
-        }
-    }
+    };
+    Some(LanguageWorker::spawn(provider))
 }
 
 /// Minimum digits reserved for line numbers.
@@ -655,7 +629,9 @@ impl InputOutcome {
 pub struct EditorSurface {
     editor: EditorState,
     display: DisplayMap,
-    highlighter: Highlighter,
+    language_worker: Option<LanguageWorker>,
+    /// The analysis last sent to the worker: `(document version, bytes)`.
+    language_requested: Option<(u64, Range<usize>)>,
     language: Language,
     highlights: IncrementalHighlights,
     language_coverage: Option<(u64, Range<usize>)>,
@@ -683,13 +659,14 @@ impl EditorSurface {
     ) -> Self {
         let editor = EditorState::new(text);
         let snapshot = editor.snapshot();
-        let highlighter = Highlighter::new(language);
+        let language_worker = language_worker(language);
         let highlights = IncrementalHighlights::new();
         let display = DisplayMap::new(&snapshot, display_config);
         let mut surface = Self {
             editor,
             display,
-            highlighter,
+            language_worker,
+            language_requested: None,
             language,
             highlights,
             language_coverage: None,
@@ -715,7 +692,7 @@ impl EditorSurface {
             return;
         }
         self.language = language;
-        self.highlighter = Highlighter::new(language);
+        self.language_worker = language_worker(language);
         let snapshot = self.editor.snapshot();
         self.refresh_language_state(&snapshot);
         self.invalidation.push(InvalidationKind::Document, None);
@@ -1033,29 +1010,30 @@ impl EditorSurface {
         let before_snapshot = self.editor.snapshot();
         let applied = self.editor.apply_with_result(transaction, grouping)?;
         let snapshot = self.editor.snapshot();
-        let mut display = self.display.clone();
-        let update = display.update(&snapshot, &applied)?;
-        self.display = display;
+        // Updated in place: cloning a million-row display map per keystroke
+        // costs more than the update itself. Should the update fail part-way,
+        // the map is rebuilt from the new snapshot so it is never torn.
+        let update = match self.display.update(&snapshot, &applied) {
+            Ok(update) => update,
+            Err(error) => {
+                let config = self.display.config().clone();
+                let folds = self.display.folds().clone();
+                self.display = DisplayMap::with_folds(&snapshot, config, folds);
+                self.refresh_language_state(&snapshot);
+                self.recompute_scroll_viewport();
+                self.invalidation.push(InvalidationKind::Document, None);
+                return Err(error.into());
+            }
+        };
+        // Existing tokens are shifted through the edit and painted until the
+        // worker's fresh ones arrive, so typing never flashes uncolored text.
         let _ = self
             .highlights
             .apply_transaction(&before_snapshot, &applied);
         self.language_coverage = None;
-        match &self.highlighter {
-            Highlighter::Rust(provider) => {
-                if let Ok(result) = provider.apply_transaction(
-                    &before_snapshot,
-                    &snapshot,
-                    &applied,
-                    update.new_range.clone(),
-                ) {
-                    let _ = self.highlights.accept_range(result);
-                }
-            }
-            // Lexical results can change anywhere below an edit (an opened
-            // string or comment), so they are re-derived for the viewport.
-            Highlighter::Generic(_) | Highlighter::Plain => {
-                self.highlights = IncrementalHighlights::new();
-            }
+        self.language_requested = None;
+        if let Some(worker) = &mut self.language_worker {
+            worker.edit(before_snapshot, snapshot, applied.change_map.clone());
         }
         self.recompute_scroll_viewport();
         self.ensure_language_state_for_viewport();
@@ -1332,13 +1310,21 @@ impl EditorSurface {
     fn refresh_language_state(&mut self, snapshot: &DocumentSnapshot) {
         self.highlights = IncrementalHighlights::new();
         self.language_coverage = None;
+        self.language_requested = None;
         self.display.set_foldable_regions([]);
         debug_assert_eq!(snapshot.version(), self.display.snapshot().version());
         self.ensure_language_state_for_viewport();
     }
 
+    /// Asks the worker for tokens and folds around the viewport when the
+    /// rows about to be painted are not covered yet. Never waits: the frame
+    /// paints what is known, and [`Self::poll_language`] applies the answer.
+    ///
+    /// The request reaches well past the viewport so smooth scrolling is
+    /// served before rows come into view, and it is re-sent once the viewport
+    /// gets within a screen of its edge rather than at the edge itself.
     fn ensure_language_state_for_viewport(&mut self) {
-        if matches!(self.highlighter, Highlighter::Plain) {
+        if self.language_worker.is_none() {
             return;
         }
         let document_version = self.display.snapshot().version();
@@ -1346,50 +1332,101 @@ impl EditorSurface {
         if rows.is_empty() {
             return;
         }
-        // Rows the frame will paint: the viewport plus the smooth-scroll
-        // buffer on both sides.
+        let viewport = self.scroll.viewport_rows.max(1);
         let top = self.scroll.top_row.min(rows.len() - 1);
-        let needed_start = top.saturating_sub(1);
-        let needed_end = top
-            .saturating_add(self.scroll.viewport_rows.saturating_add(2))
-            .min(rows.len());
-        let needed = rows[needed_start].start_byte..rows[needed_end - 1].end_byte;
-        if self
+        let byte_range = |start_row: usize, end_row: usize| {
+            let end_row = end_row.clamp(start_row + 1, rows.len());
+            rows[start_row].start_byte..rows[end_row - 1].end_byte
+        };
+        // The painted rows plus a screen of lookahead each way.
+        let wanted = byte_range(
+            top.saturating_sub(viewport),
+            top.saturating_add(viewport * 2 + 2),
+        );
+        let covers = |range: &Range<usize>| range.start <= wanted.start && range.end >= wanted.end;
+        let covered = self
             .language_coverage
             .as_ref()
-            .is_some_and(|(version, covered)| {
-                *version == document_version
-                    && covered.start <= needed.start
-                    && covered.end >= needed.end
-            })
-        {
+            .is_some_and(|(version, range)| *version == document_version && covers(range));
+        let requested = self
+            .language_requested
+            .as_ref()
+            .is_some_and(|(version, range)| *version == document_version && covers(range));
+        if covered || requested {
             return;
         }
+        let pad = (viewport * 3).max(160);
+        let range = byte_range(top.saturating_sub(pad), top + viewport + pad);
+        self.language_requested = Some((document_version, range.clone()));
+        let snapshot = self.display.snapshot().clone();
+        if let Some(worker) = &mut self.language_worker {
+            worker.analyze(snapshot, range);
+        }
+    }
 
-        // Highlight a generous window around the viewport so ordinary
-        // scrolling never leaves unhighlighted rows or fold markers behind.
-        let pad = self.scroll.viewport_rows.max(48);
-        let start_row = top.saturating_sub(pad);
-        let end_row = top
-            .saturating_add(self.scroll.viewport_rows)
-            .saturating_add(pad)
-            .min(rows.len());
-        let first = &rows[start_row];
-        let last = &rows[end_row - 1];
-        let requested = first.start_byte..last.end_byte;
-
-        if let Ok(result) = self
-            .highlighter
-            .highlight(self.display.snapshot(), requested.clone())
+    /// Applies everything the language worker has finished. Returns whether
+    /// highlights or folds changed (the host should repaint).
+    pub fn poll_language(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(outcome) = self
+            .language_worker
+            .as_mut()
+            .and_then(LanguageWorker::try_next)
         {
+            changed |= self.apply_language_outcome(outcome);
+        }
+        changed
+    }
+
+    /// Whether the language worker still has requests in flight. A host keeps
+    /// polling (one more frame) while this is true.
+    pub fn language_pending(&self) -> bool {
+        self.language_worker
+            .as_ref()
+            .is_some_and(LanguageWorker::is_busy)
+    }
+
+    /// Waits for the language worker to finish and applies its results, so
+    /// the next frame is fully highlighted. For tests and for hosts that need
+    /// a complete first paint (screenshots).
+    pub fn flush_language(&mut self) {
+        loop {
+            while let Some(outcome) = self
+                .language_worker
+                .as_mut()
+                .and_then(LanguageWorker::next_blocking)
+            {
+                self.apply_language_outcome(outcome);
+            }
+            // Applying a result may have asked for more (folds changed rows).
+            if !self.language_pending() {
+                break;
+            }
+        }
+    }
+
+    fn apply_language_outcome(&mut self, outcome: Outcome) -> bool {
+        let Outcome::Analyzed {
+            version,
+            range,
+            highlights,
+            folds,
+        } = outcome
+        else {
+            return false;
+        };
+        // An answer for a version the document has moved past is dropped;
+        // a newer request is already on its way.
+        if version != self.display.snapshot().version() {
+            return false;
+        }
+        if let Some(result) = highlights {
             let _ = self.highlights.accept_range(result);
         }
-        let line_start = first.buffer_line;
-        let line_end = last.buffer_line.saturating_add(1);
-        if let Ok(folds) = self
-            .highlighter
-            .fold_ranges(self.display.snapshot(), requested.clone())
-        {
+        if let Some(folds) = folds {
+            let map = self.display.snapshot().position_map();
+            let line_start = map.byte_to_line(range.start).unwrap_or(0);
+            let line_end = map.byte_to_line(range.end).unwrap_or(line_start) + 1;
             self.display.set_foldable_regions_in_line_range(
                 line_start..line_end,
                 folds.into_iter().map(|fold| {
@@ -1398,7 +1435,16 @@ impl EditorSurface {
                 }),
             );
         }
-        self.language_coverage = Some((document_version, requested));
+        self.language_coverage = Some((version, range));
+        if self
+            .language_requested
+            .as_ref()
+            .is_some_and(|(requested, _)| *requested == version)
+        {
+            self.language_requested = None;
+        }
+        self.invalidation.push(InvalidationKind::Decoration, None);
+        true
     }
 }
 
@@ -2906,6 +2952,7 @@ mod tests {
             DisplayConfig::unwrapped(),
             SurfaceGeometry::default(),
         );
+        surface.flush_language();
         assert!(surface.display().gutter(GUTTER_MIN_DIGITS).rows[0].foldable);
         let chevron_x = surface.gutter_width() - 4.0;
         let mut router = InputRouter::default();
@@ -2945,6 +2992,7 @@ mod tests {
             Selection::range(0, 2),
             Selection::caret(3),
         ]));
+        surface.flush_language();
         let frame = surface.render_frame();
         assert!(frame.rows.iter().any(|row| !row.tokens.is_empty()));
         assert!(frame.rows.iter().any(|row| row.active));
@@ -2962,6 +3010,7 @@ mod tests {
             EditorSurface::new(text, DisplayConfig::unwrapped(), SurfaceGeometry::default());
         surface.set_viewport(20, 120);
         surface.scroll_to(39_990, 0);
+        surface.flush_language();
 
         let frame = surface.render_frame_with_buffer(1);
         assert!(frame.rows.len() <= 22);

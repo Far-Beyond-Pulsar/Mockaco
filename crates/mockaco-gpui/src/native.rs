@@ -8,7 +8,7 @@
 //! selection and hit testing share a single set of measured metrics.
 
 use crate::chrome::{
-    self, layout_row_text, Minimap, MinimapLayout, MinimapRun, MinimapTone, RowText, SmoothScroll,
+    self, layout_row_text, MinimapLayout, MinimapRun, MinimapTone, RowText, SmoothScroll,
     Thumb, MINIMAP_CHAR_WIDTH, MINIMAP_LINE_HEIGHT, MINIMAP_MAX_COLUMNS,
 };
 use crate::{
@@ -106,8 +106,6 @@ pub struct WgpuiEditorView {
     layout: ChromeLayout,
     drag: Drag,
     hover: Region,
-    minimap: Minimap,
-    minimap_built_at: Option<Instant>,
     show_minimap: bool,
     line_backgrounds: HashMap<usize, SurfaceColor>,
     /// Show fold chevrons on every foldable line (true) or only while the
@@ -150,8 +148,6 @@ impl WgpuiEditorView {
             layout: ChromeLayout::default(),
             drag: Drag::None,
             hover: Region::None,
-            minimap: Minimap::default(),
-            minimap_built_at: None,
             show_minimap: true,
             line_backgrounds: HashMap::new(),
             always_show_fold_controls: true,
@@ -190,7 +186,6 @@ impl WgpuiEditorView {
 
     pub fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
         self.surface.set_language(language);
-        self.minimap = Minimap::default();
         cx.notify();
     }
 
@@ -217,7 +212,6 @@ impl WgpuiEditorView {
     /// Replaces the whole document (file loads, external changes).
     pub fn replace_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.surface.replace_text(text);
-        self.minimap = Minimap::default();
         self.y_scroll.jump_to(0.0);
         self.x_scroll.jump_to(0.0);
         cx.notify();
@@ -432,29 +426,10 @@ impl WgpuiEditorView {
         self.last_frame = animating.then_some(now);
         self.apply_scroll_to_surface();
 
-        // The minimap is rebuilt per document version. Very large documents
-        // throttle rebuilds so typing stays responsive; a pending rebuild
-        // keeps frames coming until it lands.
-        let mut minimap_pending = false;
-        let version = self.surface.document().version();
-        if !self.minimap.is_current(version) {
-            let large = self.surface.document().len_bytes() > 1_000_000;
-            let due = self
-                .minimap_built_at
-                .map_or(true, |built| built.elapsed().as_millis() >= 500);
-            if !large || due {
-                let snapshot = self.surface.document();
-                self.minimap = Minimap::build(
-                    snapshot.version(),
-                    snapshot.text(),
-                    self.surface.language().line_comment(),
-                );
-                self.minimap_built_at = Some(Instant::now());
-            } else {
-                minimap_pending = true;
-            }
-        }
-        animating || minimap_pending
+        // Highlights and folds arrive from the language worker; apply what
+        // is ready, and keep frames coming while it is still working.
+        self.surface.poll_language();
+        animating || self.surface.language_pending()
     }
 
     /// Whole rows/columns of the animated position drive the surface; the
@@ -959,12 +934,19 @@ impl WgpuiEditorView {
         let minimap = (self.layout.minimap_width > 0.0).then(|| {
             let layout = self.minimap_layout();
             let rows = self.surface.display().rows();
+            let snapshot = self.surface.document();
+            let map = snapshot.position_map();
+            let text = snapshot.text();
+            let comment = self.surface.language().line_comment();
+            // Only the lines the minimap shows are read, whatever the
+            // document's length.
             let lines = (layout.first_line..layout.last_line)
                 .filter_map(|row| {
-                    let buffer_line = rows.get(row)?.buffer_line;
+                    let line = rows.get(row)?.buffer_line;
+                    let source = text.get(map.line_start(line).ok()?..map.line_end(line).ok()?)?;
                     Some((
                         row as f32 * MINIMAP_LINE_HEIGHT - layout.content_offset,
-                        self.minimap.line(buffer_line).to_vec(),
+                        chrome::minimap_line(source, comment),
                     ))
                 })
                 .collect();
