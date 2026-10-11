@@ -530,6 +530,10 @@ pub enum EditCommand {
     DeleteWordBackward,
     DeleteWordForward,
     SelectAll,
+    /// Ctrl+Alt+Up: add a caret one row above the topmost cursor.
+    AddCursorAbove,
+    /// Ctrl+Alt+Down: add a caret one row below the bottom-most cursor.
+    AddCursorBelow,
     ToggleFold,
     UnfoldAll,
     Newline,
@@ -962,9 +966,12 @@ impl EditorSurface {
         let Some(selection) = self.editor.selections().primary() else {
             return false;
         };
-        let Ok(point) = self
-            .display
-            .buffer_to_display(selection.cursor(), Affinity::After)
+        self.reveal_byte(selection.cursor())
+    }
+
+    /// Scrolls the least distance that brings `byte` fully into view.
+    pub fn reveal_byte(&mut self, byte: usize) -> bool {
+        let Ok(point) = self.display.buffer_to_display(byte, Affinity::After)
         else {
             return false;
         };
@@ -1634,6 +1641,9 @@ pub struct InputRouter {
     goal_column: Option<usize>,
     /// The previous routed event was a single typed character.
     typing: bool,
+    /// Where cursor stacking (Ctrl+Alt+Up/Down) started: Esc collapses back
+    /// to the cursor nearest it, as VS Code returns to the original cursor.
+    cursor_origin: Option<usize>,
     /// The event being routed continues the previous typing run, so its
     /// edit merges into the current undo group.
     group_next: bool,
@@ -1738,6 +1748,8 @@ impl InputRouter {
             Key::Right if word => Some(EditCommand::MoveWordRight { extend }),
             Key::Left => Some(EditCommand::MoveLeft { extend }),
             Key::Right => Some(EditCommand::MoveRight { extend }),
+            Key::Up if word && event.modifiers.alt => Some(EditCommand::AddCursorAbove),
+            Key::Down if word && event.modifiers.alt => Some(EditCommand::AddCursorBelow),
             Key::Up => Some(EditCommand::MoveUp { extend }),
             Key::Down => Some(EditCommand::MoveDown { extend }),
             Key::PageUp => Some(EditCommand::MovePageUp { extend }),
@@ -1757,6 +1769,10 @@ impl InputRouter {
         surface: &mut EditorSurface,
         event: InputEvent,
     ) -> Result<InputOutcome, SurfaceError> {
+        // A click starts over from a single cursor.
+        if matches!(event, InputEvent::Mouse(MouseEvent::Down { .. })) {
+            self.cursor_origin = None;
+        }
         // Consecutive single-character typing merges into one undo step.
         let typed = matches!(&event, InputEvent::Text(text)
             if text.chars().count() == 1 && !text.contains('\n'));
@@ -1789,6 +1805,58 @@ impl InputRouter {
             outcome.scroll_changed |= surface.reveal_primary_caret();
         }
         Ok(outcome)
+    }
+
+    /// Adds a caret one display row above the topmost cursor (`below` false)
+    /// or below the bottom-most one, at the shared goal column, and scrolls
+    /// it into view. Existing selections are kept.
+    fn add_cursor(&mut self, surface: &mut EditorSurface, below: bool) -> InputOutcome {
+        let selections = surface.editor.selections().clone();
+        let edge = if below {
+            selections.selections().iter().max_by_key(|s| s.head)
+        } else {
+            selections.selections().iter().min_by_key(|s| s.head)
+        };
+        let Some(edge) = edge.copied() else {
+            return InputOutcome::handled();
+        };
+        let Ok(point) = surface.display.buffer_to_display(edge.head, Affinity::After) else {
+            return InputOutcome::handled();
+        };
+        let row = if below {
+            point.row + 1
+        } else if let Some(row) = point.row.checked_sub(1) {
+            row
+        } else {
+            return InputOutcome::handled();
+        };
+        let Some(target_row) = surface.display.row(row) else {
+            return InputOutcome::handled();
+        };
+        if self.cursor_origin.is_none() {
+            self.cursor_origin = surface.editor.selections().primary().map(|s| s.head);
+        }
+        let column = *self.goal_column.get_or_insert(point.column);
+        let Ok(target) = surface.display.display_to_buffer(
+            DisplayPoint {
+                row,
+                column: column.min(target_row.display_width),
+            },
+            Affinity::Before,
+        ) else {
+            return InputOutcome::handled();
+        };
+        let mut next: Vec<Selection> = selections.selections().to_vec();
+        next.push(Selection::caret(target.byte_offset));
+        surface.editor.set_selections(SelectionSet::new(next));
+        surface.invalidation.push(InvalidationKind::Selection, None);
+        // Reveal the new caret (the primary is the bottom-most, which would
+        // scroll back down after an add above).
+        let scroll_changed = surface.reveal_byte(target.byte_offset);
+        InputOutcome {
+            scroll_changed,
+            ..InputOutcome::handled()
+        }
     }
 
     fn grouping(&self) -> Grouping {
@@ -2127,6 +2195,8 @@ impl InputRouter {
                 surface.unfold_all();
                 Ok(InputOutcome::handled())
             }
+            EditCommand::AddCursorAbove => Ok(self.add_cursor(surface, false)),
+            EditCommand::AddCursorBelow => Ok(self.add_cursor(surface, true)),
             EditCommand::CancelComposition => {
                 let mut outcome = InputOutcome::handled();
                 outcome.composition_changed = surface.editor.cancel_composition();
@@ -2134,6 +2204,33 @@ impl InputRouter {
                     surface
                         .invalidation
                         .push(InvalidationKind::Composition, None);
+                    return Ok(outcome);
+                }
+                // Esc: several cursors become the original one; a single
+                // selection becomes a caret.
+                let selections = surface.editor.selections().clone();
+                let single = if selections.len() > 1 {
+                    let origin = self.cursor_origin.take();
+                    origin
+                        .and_then(|origin| {
+                            selections
+                                .selections()
+                                .iter()
+                                .min_by_key(|selection| selection.head.abs_diff(origin))
+                                .copied()
+                        })
+                        .or_else(|| selections.primary())
+                } else {
+                    selections
+                        .primary()
+                        .filter(|selection| !selection.is_caret())
+                        .map(|selection| Selection::caret(selection.head))
+                };
+                if let Some(single) = single {
+                    surface.editor.set_selections(SelectionSet::new([single]));
+                    surface.invalidation.push(InvalidationKind::Selection, None);
+                    self.goal_column = None;
+                    outcome.selection_changed = true;
                 }
                 Ok(outcome)
             }
@@ -2862,6 +2959,49 @@ mod tests {
         assert!(surface.scroll().top_row > 0);
     }
 
+
+    #[test]
+    fn ctrl_alt_arrows_stack_cursors_and_escape_returns_to_the_original() {
+        let mut surface = surface("alpha\nbeta\ngamma\ndelta\n");
+        let mut router = InputRouter::default();
+        let key = |key: Key, control: bool, alt: bool| {
+            InputEvent::Key(KeyEvent {
+                key,
+                modifiers: KeyModifiers {
+                    control,
+                    alt,
+                    ..KeyModifiers::default()
+                },
+            })
+        };
+        // Caret on "beta" at column 2.
+        surface.editor_mut().set_selections(SelectionSet::caret(8));
+        router.route(&mut surface, key(Key::Down, true, true)).unwrap();
+        router.route(&mut surface, key(Key::Down, true, true)).unwrap();
+        router.route(&mut surface, key(Key::Up, true, true)).unwrap();
+        let heads: Vec<usize> = surface
+            .editor()
+            .selections()
+            .selections()
+            .iter()
+            .map(|selection| selection.head)
+            .collect();
+        // alpha|2, beta|2, gamma|2, delta|2.
+        assert_eq!(heads, [2, 8, 13, 19]);
+
+        // Typing goes to every cursor.
+        router.route(&mut surface, InputEvent::Text("X".into())).unwrap();
+        assert_eq!(
+            surface.editor().document().text(),
+            "alXpha\nbeXta\ngaXmma\ndeXlta\n"
+        );
+
+        // Esc keeps only the cursor the stack started from (on "beta").
+        router.route(&mut surface, key(Key::Escape, false, false)).unwrap();
+        let selections = surface.editor().selections().selections().to_vec();
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].head, 10);
+    }
     #[test]
     fn navigation_handles_all_directions_and_preserves_vertical_goal() {
         let mut surface = EditorSurface::new(

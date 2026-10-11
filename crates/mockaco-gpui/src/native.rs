@@ -7,8 +7,11 @@
 //! else. All painting goes through one canvas-style element so text, caret,
 //! selection and hit testing share a single set of measured metrics.
 
+type MinimapKey = (u64, u64, u64, &'static str);
+
 use crate::chrome::{
-    self, layout_row_text, MinimapLayout, MinimapRun, MinimapTone, RowText, SmoothScroll,
+    self, layout_row_text, MinimapBuffer, MinimapLayout, MinimapRun, MinimapTone, RowText,
+    SmoothScroll,
     Thumb, MINIMAP_CHAR_WIDTH, MINIMAP_LINE_HEIGHT, MINIMAP_MAX_COLUMNS,
 };
 use crate::{
@@ -22,15 +25,16 @@ use mockaco_renderer::{
     DIAGNOSTIC_WARNING_STYLE_ID, SEARCH_CURRENT_MATCH_STYLE_ID, SEARCH_MATCH_STYLE_ID,
 };
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Instant;
 use wgpui::{
-    canvas, div, fill, font, inflate_for_buffer, point, prepare_scroll_buffer, px, size,
-    with_buffer_mask, App, Bounds, ClipboardItem, ContentMask, Context, Corners,
+    div, fill, font, point, px, size,
+    App, Bounds, ClipboardItem, ContentMask, Context, Corners,
     CursorStyle, DispatchPhase, Element, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
     Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, GlobalElementId, Hitbox,
     HitboxBehavior, Hsla, InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent,
-    LayerPolicy, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    PathBuilder, Pixels, ScrollBufferFrame, StatefulInteractiveElement,
+    LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+    PathBuilder, Pixels,
     Point, Render, Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Size, Style, Styled,
     TextRun, Window,
 };
@@ -115,6 +119,7 @@ pub struct WgpuiEditorView {
     /// Show fold chevrons on every foldable line (true) or only while the
     /// pointer is over the gutter (false).
     always_show_fold_controls: bool,
+    minimap_buffer: Option<Rc<MinimapBuffer<MinimapKey>>>,
 }
 
 impl EventEmitter<EditorEvent> for WgpuiEditorView {}
@@ -156,6 +161,7 @@ impl WgpuiEditorView {
             show_minimap: true,
             line_backgrounds: HashMap::new(),
             always_show_fold_controls: true,
+            minimap_buffer: None,
         }
     }
 
@@ -438,6 +444,7 @@ impl WgpuiEditorView {
         // Highlights and folds arrive from the language worker; apply what
         // is ready, and keep frames coming while it is still working.
         self.surface.poll_language();
+        self.refresh_minimap_buffer();
         animating || self.surface.language_pending()
     }
 
@@ -955,14 +962,46 @@ impl WgpuiEditorView {
     }
 
     /// What the minimap's content depends on, scroll excepted: while this is
-    /// unchanged its buffered layer only shifts.
-    fn minimap_key(&self) -> (u64, u64, u64, &'static str) {
+    /// unchanged its buffered rows only shift. Active folds are hashed, not
+    /// the display revision, which also moves when fold markers arrive.
+    fn minimap_key(&self) -> MinimapKey {
+        use std::hash::{Hash, Hasher};
+        let mut folds = std::collections::hash_map::DefaultHasher::new();
+        for region in self.surface.display().folds().regions() {
+            (region.start_line, region.end_line).hash(&mut folds);
+        }
         (
             self.surface.document().version(),
-            self.surface.display().revision(),
+            folds.finish(),
             self.theme_revision,
             self.surface.language().id(),
         )
+    }
+
+    /// Keeps the minimap's overscroll buffer valid for this frame, rebuilding
+    /// it only when the content changed or the scroll left its central half.
+    fn refresh_minimap_buffer(&mut self) {
+        if self.layout.minimap_width <= 0.0 {
+            self.minimap_buffer = None;
+            return;
+        }
+        let height = self.layout.viewport_height;
+        let offset = self.minimap_layout().content_offset;
+        let key = self.minimap_key();
+        if self
+            .minimap_buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.serves(&key, offset, height))
+        {
+            return;
+        }
+        let span = MinimapBuffer::<MinimapKey>::span(
+            offset,
+            height,
+            self.surface.display().row_count(),
+        );
+        let rows = self.minimap_rows(span);
+        self.minimap_buffer = Some(Rc::new(MinimapBuffer::new(key, offset, height, rows)));
     }
 
 
@@ -995,6 +1034,10 @@ impl WgpuiEditorView {
             vthumb: self.vertical_thumb(),
             hthumb: self.horizontal_thumb(),
             always_show_fold_controls: self.always_show_fold_controls,
+            minimap_buffer: self.minimap_buffer.clone(),
+            minimap: (self.layout.minimap_width > 0.0).then(|| self.minimap_layout()),
+            minimap_active: matches!(self.drag, Drag::Minimap { .. })
+                || self.hover == Region::Minimap,
         }
     }
 }
@@ -1018,13 +1061,15 @@ struct PaintData {
     vthumb: Option<Thumb>,
     hthumb: Option<Thumb>,
     always_show_fold_controls: bool,
+    minimap_buffer: Option<Rc<MinimapBuffer<MinimapKey>>>,
+    /// The minimap's scroll and slider, when it is shown.
+    minimap: Option<MinimapLayout>,
+    minimap_active: bool,
 }
 
 impl Render for WgpuiEditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let editor = cx.entity();
-        let layout = self.layout;
-        let mut root = div()
+        div()
             .size_full()
             .relative()
             .overflow_hidden()
@@ -1033,33 +1078,8 @@ impl Render for WgpuiEditorView {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(EditorElement {
-                editor: editor.clone(),
-            });
-        if layout.minimap_width > 0.0 {
-            // Half the minimap's height pre-rendered above and below.
-            let margin = (layout.viewport_height * 0.5).floor().max(0.0);
-            let place = |element: wgpui::Div| {
-                element
-                    .absolute()
-                    .top_0()
-                    .right(px(VBAR_WIDTH))
-                    .w(px(layout.minimap_width))
-                    .h(px(layout.viewport_height))
-            };
-            root = root
-                .child(
-                    place(div())
-                        .id("mockaco-minimap")
-                        .layer_keyed(self.minimap_key())
-                        .layer_with_policy(LayerPolicy {
-                            overdraw_margin: size(px(0.), px(margin)),
-                            ..LayerPolicy::default()
-                        })
-                        .child(minimap_canvas(editor.clone())),
-                )
-                .child(place(div()).child(minimap_overlay(editor)));
-        }
-        root
+                editor: cx.entity(),
+            })
     }
 }
 
@@ -1403,6 +1423,7 @@ fn paint_editor(data: &PaintData, bounds: Bounds<Pixels>, window: &mut Window, c
 
     paint_gutter(data, origin, window);
     paint_gutter_numbers(data, origin, window, cx);
+    paint_minimap(data, origin, window);
     paint_scrollbars(data, origin, window);
 }
 
@@ -1596,113 +1617,55 @@ fn minimap_tone_color(theme: &SurfaceTheme, tone: MinimapTone) -> SurfaceColor {
     }
 }
 
-/// The minimap's lines, for one frame of its buffered layer.
-struct MinimapDraw {
-    /// Minimap content scroll, in px.
-    offset: f32,
-    /// How far past the bounds this frame draws (zero for a viewport frame).
-    margin: f32,
-    rows: Vec<(usize, Vec<MinimapRun>)>,
-    theme: SurfaceTheme,
-}
 
-/// The minimap's content, drawn into an overscroll-buffered layer.
-///
-/// The layer's texture covers the minimap plus half its height above and
-/// below. Scrolling only shifts that texture; the lines are redrawn once the
-/// shift passes half the margin (a quarter of the height), re-centred on the
-/// current position, so a refill always lands before the edge of the
-/// pre-rendered area comes into view. Nothing ever scrolls past the
-/// document's bounds: the margin is only pre-rendered content.
-fn minimap_canvas(editor: Entity<WgpuiEditorView>) -> impl IntoElement {
-    canvas(
-        move |bounds, window, cx| {
-            let view = editor.read(cx);
-            let layout = view.minimap_layout();
-            let offset = layout.content_offset;
-            let margin = match prepare_scroll_buffer(window, bounds, point(px(0.), px(-offset))) {
-                ScrollBufferFrame::Skip => return None,
-                ScrollBufferFrame::Buffer { margin } => margin.height.to_f32(),
-                ScrollBufferFrame::Viewport => 0.0,
-            };
-            let height = bounds.size.height.to_f32();
-            let row_count = view.surface.display().row_count();
-            let first = ((offset - margin) / MINIMAP_LINE_HEIGHT).floor().max(0.0) as usize;
-            let last = ((((offset + height + margin) / MINIMAP_LINE_HEIGHT).ceil() as usize) + 1)
-                .min(row_count)
-                .max(first);
-            Some(MinimapDraw {
-                offset,
-                margin,
-                rows: view.minimap_rows(first..last),
-                theme: view.surface.theme(),
-            })
-        },
-        move |bounds, draw, window, _cx| {
-            let Some(draw) = draw else {
-                return;
-            };
-            let buffered = draw.margin > 0.0;
-            let mask_bounds = if buffered {
-                inflate_for_buffer(bounds, size(px(0.), px(draw.margin)))
-            } else {
-                bounds
-            };
-            let content_mask = ContentMask {
-                bounds: mask_bounds,
-            };
-            let buffer_mask = buffered.then(|| content_mask.clone());
-            window.with_content_mask(Some(content_mask), |window| {
-                with_buffer_mask(window, buffer_mask, |window| {
-                    for (row, runs) in &draw.rows {
-                        let y = *row as f32 * MINIMAP_LINE_HEIGHT - draw.offset;
-                        for run in runs {
-                            window.paint_quad(fill(
-                                rect(
-                                    bounds.origin,
-                                    MINIMAP_PADDING + run.start as f32 * MINIMAP_CHAR_WIDTH,
-                                    y,
-                                    run.len as f32 * MINIMAP_CHAR_WIDTH,
-                                    MINIMAP_LINE_HEIGHT - 0.5,
-                                ),
-                                hsla(minimap_tone_color(&draw.theme, run.tone)),
-                            ));
-                        }
-                    }
-                });
-            });
-        },
-    )
-    .size_full()
-}
-
-/// The minimap's edge and its viewport slider. Drawn over the buffered
-/// minimap every frame: the slider moves with every scroll, so it must not
-/// live in the cached texture.
-fn minimap_overlay(editor: Entity<WgpuiEditorView>) -> impl IntoElement {
-    canvas(
-        |_, _, _| (),
-        move |bounds, (), window, cx| {
-            let view = editor.read(cx);
-            let layout = view.minimap_layout();
-            let theme = view.surface.theme();
-            let active =
-                matches!(view.drag, Drag::Minimap { .. }) || view.hover == Region::Minimap;
-            let origin = bounds.origin;
-            let width = bounds.size.width.to_f32();
-            window.with_content_mask(mask(bounds), |window| {
+/// The minimap: its buffered rows shifted to the current scroll, its edge,
+/// and the viewport slider on top.
+fn paint_minimap(data: &PaintData, origin: Point<Pixels>, window: &mut Window) {
+    let (Some(minimap), Some(buffer)) = (&data.minimap, &data.minimap_buffer) else {
+        return;
+    };
+    let layout = data.layout;
+    let theme = &data.frame.theme;
+    let height = layout.viewport_height;
+    let clip = rect(origin, layout.minimap_left, 0.0, layout.minimap_width, height);
+    window.with_content_mask(mask(clip), |window| {
+        for (row, runs) in &buffer.rows {
+            let y = *row as f32 * MINIMAP_LINE_HEIGHT - minimap.content_offset;
+            // The buffer reaches past the minimap; only rows in view paint.
+            if y + MINIMAP_LINE_HEIGHT < 0.0 || y > height {
+                continue;
+            }
+            for run in runs {
                 window.paint_quad(fill(
-                    rect(origin, 0.0, 0.0, 1.0, bounds.size.height.to_f32()),
-                    hsla(with_alpha(theme.foreground, 18)),
+                    rect(
+                        origin,
+                        layout.minimap_left + MINIMAP_PADDING + run.start as f32 * MINIMAP_CHAR_WIDTH,
+                        y,
+                        run.len as f32 * MINIMAP_CHAR_WIDTH,
+                        MINIMAP_LINE_HEIGHT - 0.5,
+                    ),
+                    hsla(minimap_tone_color(theme, run.tone)),
                 ));
-                window.paint_quad(fill(
-                    rect(origin, 0.0, layout.slider_top, width, layout.slider_height),
-                    hsla(with_alpha(theme.foreground, if active { 38 } else { 22 })),
-                ));
-            });
-        },
-    )
-    .size_full()
+            }
+        }
+        window.paint_quad(fill(
+            rect(origin, layout.minimap_left, 0.0, 1.0, height),
+            hsla(with_alpha(theme.foreground, 18)),
+        ));
+        window.paint_quad(fill(
+            rect(
+                origin,
+                layout.minimap_left,
+                minimap.slider_top,
+                layout.minimap_width,
+                minimap.slider_height,
+            ),
+            hsla(with_alpha(
+                theme.foreground,
+                if data.minimap_active { 38 } else { 22 },
+            )),
+        ));
+    });
 }
 
 fn paint_scrollbars(data: &PaintData, origin: Point<Pixels>, window: &mut Window) {
