@@ -537,15 +537,39 @@ fn render_block(
     }
 }
 
-/// The documentation blocks of `card` as a virtualized list that sizes to its
-/// content up to `max_height`.
+/// Pages with more blocks than this are virtualized; shorter ones are laid out
+/// directly.
+const VIRTUALIZE_ABOVE_BLOCKS: usize = 48;
+
+/// The documentation blocks of `card`, at most `max_height` tall.
+///
+/// A typical hover page is a handful of blocks. Those are laid out like any
+/// element so the card hugs its content exactly (a virtualized list has to
+/// estimate the height of rows it has not measured, and an estimate that is
+/// too large leaves an empty card). Only a long page -- a big module's docs --
+/// goes through the virtualized [`list`], at a fixed height.
 fn blocks_list(
     card: &HoverCard,
     colors: PopupColors,
     mono: SharedString,
     size: f32,
     max_height: f32,
+    window: &Window,
 ) -> AnyElement {
+    if card.blocks.len() <= VIRTUALIZE_ABOVE_BLOCKS {
+        return div()
+            .id("mockaco-doc-scroll")
+            .w_full()
+            .max_h(px(max_height))
+            .overflow_y_scroll()
+            .children(
+                card.blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, block)| render_block(block, index, &colors, &mono, size, window)),
+            )
+            .into_any_element();
+    }
     let blocks = card.blocks.clone();
     list(card.list.clone(), move |index, window, _cx| {
         match blocks.get(index) {
@@ -553,9 +577,8 @@ fn blocks_list(
             None => div().into_any_element(),
         }
     })
-    .with_sizing_behavior(wgpui::ListSizingBehavior::Infer)
     .w_full()
-    .max_h(px(max_height))
+    .h(px(max_height))
     .into_any_element()
 }
 
@@ -581,6 +604,8 @@ pub(crate) fn hover_card(
     colors: PopupColors,
     mono: SharedString,
     size: f32,
+    max_height: f32,
+    window: &Window,
     on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let mut shell = card_shell(&colors, CARD_WIDTH)
@@ -619,7 +644,9 @@ pub(crate) fn hover_card(
         shell = shell.child(div().w_full().h(px(1.0)).my(px(4.0)).bg(colors.border));
     }
     if !card.blocks.is_empty() {
-        shell = shell.child(blocks_list(card, colors, mono, size, CARD_MAX_HEIGHT));
+        // The diagnostics above the docs take their share of the card.
+        let docs_height = (max_height - card.diagnostics.len() as f32 * 40.0 - 24.0).max(80.0);
+        shell = shell.child(blocks_list(card, colors, mono, size, docs_height, window));
     }
     shell.into_any_element()
 }
@@ -755,6 +782,7 @@ pub(crate) fn completion_menu(
     colors: PopupColors,
     mono: SharedString,
     size: f32,
+    window: &Window,
     on_pick: Rc<dyn Fn(usize, &mut Window, &mut App)>,
 ) -> AnyElement {
     let count = session.borrow().len();
@@ -835,7 +863,14 @@ pub(crate) fn completion_menu(
             row = row.child(
                 card_shell(&colors, CARD_WIDTH * 0.8)
                     .text_size(px(size))
-                    .child(blocks_list(&docs.card, colors, mono, size, DOCS_MAX_HEIGHT)),
+                    .child(blocks_list(
+                        &docs.card,
+                        colors,
+                        mono,
+                        size,
+                        DOCS_MAX_HEIGHT,
+                        window,
+                    )),
             );
         }
     }
@@ -863,4 +898,58 @@ pub(crate) fn entry_doc_blocks(entry: &CompletionEntry) -> String {
         markdown.push_str(documentation);
     }
     markdown
+}
+
+/// Which side of the line a card goes on, and the tallest it may be there.
+///
+/// Both come from the room actually around the word, never from a guess about
+/// the card's size: below when the full height fits, otherwise whichever side
+/// has more room. The card then hugs its content up to that height, so its
+/// size and side depend only on where the word is in the window, not on how it
+/// got there.
+pub(crate) fn card_placement(line_top: f32, line_bottom: f32, viewport_height: f32) -> (bool, f32) {
+    const MARGIN: f32 = 8.0;
+    const MIN_HEIGHT: f32 = 80.0;
+    let room_below = viewport_height - line_bottom - MARGIN;
+    let room_above = line_top - MARGIN;
+    let below = room_below >= CARD_MAX_HEIGHT || room_below >= room_above;
+    let room = if below { room_below } else { room_above };
+    (below, CARD_MAX_HEIGHT.min(room).max(MIN_HEIGHT))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_word_near_the_top_gets_a_full_height_card_below() {
+        assert_eq!(card_placement(40.0, 60.0, 900.0), (true, CARD_MAX_HEIGHT));
+    }
+
+    #[test]
+    fn a_word_near_the_bottom_puts_the_card_above_with_the_room_it_has() {
+        let (below, height) = card_placement(800.0, 820.0, 900.0);
+        assert!(!below);
+        assert_eq!(height, CARD_MAX_HEIGHT);
+        let (below, height) = card_placement(200.0, 220.0, 280.0);
+        assert!(!below);
+        assert_eq!(height, 192.0);
+    }
+
+    #[test]
+    fn the_card_is_sized_to_the_roomier_side_and_never_collapses() {
+        let (below, height) = card_placement(300.0, 320.0, 500.0);
+        assert_eq!((below, height), (false, 292.0));
+        let (_, height) = card_placement(30.0, 50.0, 100.0);
+        assert_eq!(height, 80.0);
+    }
+
+    #[test]
+    fn placement_does_not_depend_on_history() {
+        // Same window position, same answer.
+        assert_eq!(
+            card_placement(500.0, 520.0, 900.0),
+            card_placement(500.0, 520.0, 900.0)
+        );
+    }
 }

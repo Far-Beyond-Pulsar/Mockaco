@@ -20,3 +20,7 @@ wgpui = { package = "gpui-ce", git = "https://github.com/Far-Beyond-Pulsar/WGPUI
 
 [lib]
 path = "src/lib.rs"
+
+[dev-dependencies]
+wgpui = { package = "gpui-ce", git = "https://github.com/Far-Beyond-Pulsar/WGPUI", features = ["test-support"] }
+futures = "0.3"

@@ -807,6 +807,7 @@ impl WgpuiEditorView {
                         colors,
                         mono.clone(),
                         POPUP_TEXT_SIZE,
+                        window,
                         on_pick,
                     );
                     overlays.push(place(
@@ -826,20 +827,20 @@ impl WgpuiEditorView {
                 (self.intel.hover_card.clone(), self.intel.hover_word.clone())
             {
                 if let Some((left, top, bottom)) = self.overlay_position(word.start) {
+                    let (below, card_height) = popups::card_placement(top, bottom, viewport_height);
                     let hover = editor.clone();
                     let element = popups::hover_card(
                         &card,
                         colors,
                         mono,
                         POPUP_TEXT_SIZE,
+                        card_height,
+                        window,
                         move |hovered: &bool, _window: &mut Window, cx: &mut App| {
                             let hovered = *hovered;
                             hover.update(cx, |view, cx| view.set_card_hovered(hovered, cx));
                         },
                     );
-                    // The card's height is not known before layout; prefer
-                    // below unless the word sits in the lower part of the window.
-                    let below = bottom + popups::CARD_MAX_HEIGHT * 0.6 < viewport_height;
                     overlays.push(place(element, left, top, bottom, below));
                 }
             }
