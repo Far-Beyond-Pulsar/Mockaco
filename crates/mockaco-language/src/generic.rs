@@ -9,7 +9,7 @@
 //! provider produced the tokens.
 
 use crate::{
-    clamp_range, DocumentSnapshot, FoldRange, FoldingProvider, HighlightResult, LanguageError,
+    clamp_range, clamp_str_range, DocumentSnapshot, FoldRange, FoldingProvider, HighlightResult, LanguageError,
     SyntaxHighlightProvider, SyntaxToken,
 };
 use std::ops::Range;
@@ -462,7 +462,7 @@ pub fn lex(
     base_line: usize,
     syntax: &LanguageSyntax,
 ) -> LexOutput {
-    let window = clamp_range(text, window);
+    let window = clamp_str_range(text, window);
     let mut lexer = Lexer {
         text,
         b: text.as_bytes(),
@@ -1215,7 +1215,13 @@ impl GenericSyntaxProvider {
                 start..end
             };
             let base_line = map.byte_to_line(window.start).unwrap_or(0);
-            let output = lex(text, window.clone(), base_line, self.syntax);
+            // Only the window is read out of the rope; tokens are shifted
+            // back to document offsets.
+            let source = text.slice(window.clone());
+            let mut output = lex(&source, 0..source.len(), base_line, self.syntax);
+            for token in &mut output.tokens {
+                token.range = token.range.start + window.start..token.range.end + window.start;
+            }
             *guard = Some(Cache {
                 version: snapshot.version(),
                 window,

@@ -53,7 +53,7 @@ impl Provider {
             let applied = AppliedTransaction {
                 before_version: before.version(),
                 after_version: after.version(),
-                text: String::new(),
+                text: Default::default(),
                 change_map: changes.clone(),
                 inverse: Transaction::new(),
             };

@@ -156,8 +156,10 @@ impl WgpuiEditorView {
 
     // ---- host API -------------------------------------------------------
 
+    /// The whole document as one string: O(document size). For saving and
+    /// handing the file to other tools, never per keystroke or per frame.
     pub fn text(&self) -> String {
-        self.surface.document().text().to_owned()
+        self.surface.document().text().to_string()
     }
 
     pub fn render_frame(&self) -> RenderFrame {
@@ -210,7 +212,7 @@ impl WgpuiEditorView {
     }
 
     /// Replaces the whole document (file loads, external changes).
-    pub fn replace_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+    pub fn replace_text(&mut self, text: impl Into<mockaco_core::Text>, cx: &mut Context<Self>) {
         self.surface.replace_text(text);
         self.y_scroll.jump_to(0.0);
         self.x_scroll.jump_to(0.0);
@@ -236,10 +238,11 @@ impl WgpuiEditorView {
             return;
         };
         let text = self.surface.document().text();
-        let caret = text[start..end]
-            .char_indices()
+        let caret = text
+            .chars_from(start)
+            .take_while(|(offset, _)| *offset < end)
             .nth(column)
-            .map_or(end, |(offset, _)| start + offset);
+            .map_or(end, |(offset, _)| offset);
         self.surface
             .editor_mut()
             .set_selections(SelectionSet::caret(caret));
@@ -933,7 +936,7 @@ impl WgpuiEditorView {
             .collect();
         let minimap = (self.layout.minimap_width > 0.0).then(|| {
             let layout = self.minimap_layout();
-            let rows = self.surface.display().rows();
+            let display = self.surface.display();
             let snapshot = self.surface.document();
             let map = snapshot.position_map();
             let text = snapshot.text();
@@ -942,11 +945,18 @@ impl WgpuiEditorView {
             // document's length.
             let lines = (layout.first_line..layout.last_line)
                 .filter_map(|row| {
-                    let line = rows.get(row)?.buffer_line;
-                    let source = text.get(map.line_start(line).ok()?..map.line_end(line).ok()?)?;
+                    let line = display.row(row)?.buffer_line;
+                    let (start, end) = (map.line_start(line).ok()?, map.line_end(line).ok()?);
+                    // At most what the minimap can show of the line.
+                    let source: String = text
+                        .chars_from(start)
+                        .take_while(|(offset, _)| *offset < end)
+                        .take(MINIMAP_MAX_COLUMNS * 2)
+                        .map(|(_, c)| c)
+                        .collect();
                     Some((
                         row as f32 * MINIMAP_LINE_HEIGHT - layout.content_offset,
-                        chrome::minimap_line(source, comment),
+                        chrome::minimap_line(&source, comment),
                     ))
                 })
                 .collect();

@@ -1,4 +1,4 @@
-use crate::{Document, DocumentError, DocumentSnapshot};
+use crate::{Document, DocumentError, DocumentSnapshot, Text};
 use std::fmt;
 use std::ops::Range;
 
@@ -128,7 +128,7 @@ impl Transaction {
         self.edits.is_empty()
     }
 
-    pub fn validate(&self, source: &str) -> Result<Vec<Edit>, EditError> {
+    pub fn validate(&self, source: &Text) -> Result<Vec<Edit>, EditError> {
         let mut edits = self.edits.clone();
         edits.sort_by_key(|edit| edit.range.start);
         let len = source.len();
@@ -173,23 +173,26 @@ impl Transaction {
 
     pub fn apply(
         &self,
-        source: &str,
+        source: &Text,
         version: u64,
     ) -> Result<AppliedTransaction, TransactionError> {
         let edits = self.validate(source).map_err(TransactionError::Invalid)?;
-        let mut text = String::with_capacity(source.len());
+        // The rope is cloned in O(1) and edited in place; every chunk the
+        // edits do not touch stays shared with `source`.
+        let mut text = source.clone();
         let mut inverse = Vec::with_capacity(edits.len());
-        let mut cursor = 0;
+        let mut delta: isize = 0;
         for edit in &edits {
-            text.push_str(&source[cursor..edit.range.start]);
-            let old_text = &source[edit.range.clone()];
-            let new_start = text.len();
-            text.push_str(&edit.replacement);
-            let new_end = text.len();
-            inverse.push(Edit::replace(new_start..new_end, old_text));
-            cursor = edit.range.end;
+            let start = (edit.range.start as isize + delta) as usize;
+            let end = (edit.range.end as isize + delta) as usize;
+            let old_text = source.slice(edit.range.clone()).into_owned();
+            text.replace(start..end, &edit.replacement);
+            inverse.push(Edit::replace(
+                start..start + edit.replacement.len(),
+                old_text,
+            ));
+            delta += edit.replacement.len() as isize - edit.range.len() as isize;
         }
-        text.push_str(&source[cursor..]);
         let change_map = ChangeMap::new(edits.clone());
         let inverse = Transaction::from_edits(inverse);
         Ok(AppliedTransaction {
@@ -295,7 +298,8 @@ impl ChangeMap {
 pub struct AppliedTransaction {
     pub before_version: u64,
     pub after_version: u64,
-    pub text: String,
+    /// The text after the transaction. Cloning it is O(1).
+    pub text: Text,
     pub change_map: ChangeMap,
     pub inverse: Transaction,
 }

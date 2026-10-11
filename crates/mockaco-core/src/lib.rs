@@ -11,6 +11,7 @@ mod lifecycle;
 mod position_map;
 mod search;
 mod selection;
+mod text;
 mod transaction;
 mod undo;
 
@@ -29,6 +30,7 @@ pub use position_map::{
 };
 pub use search::{CaseSensitivity, ReplaceResult, SearchError, SearchQuery, SearchSession};
 pub use selection::{Selection, SelectionSet};
+pub use text::{ByteChunks, CharIndices, Text};
 pub use transaction::{
     Affinity, AppliedTransaction, ChangeMap, Edit, EditError, Transaction, TransactionError,
 };
@@ -43,14 +45,14 @@ mod tests {
         let text = "a😀e\r\ncombining e\u{301}\nlast";
         let map = PositionMap::new(text);
         let emoji_end = "a😀".len();
-        assert_eq!(map.byte_to_utf16(text, emoji_end).unwrap(), 3);
-        assert_eq!(map.utf16_to_byte(text, 3).unwrap(), emoji_end);
+        assert_eq!(map.byte_to_utf16(emoji_end).unwrap(), 3);
+        assert_eq!(map.utf16_to_byte(3).unwrap(), emoji_end);
         assert_eq!(
-            map.byte_to_utf16_position(text, emoji_end).unwrap(),
+            map.byte_to_utf16_position(emoji_end).unwrap(),
             TextPosition { line: 0, column: 3 }
         );
         assert_eq!(
-            map.utf16_position_to_byte(text, TextPosition { line: 0, column: 3 })
+            map.utf16_position_to_byte(TextPosition { line: 0, column: 3 })
                 .unwrap(),
             emoji_end
         );
@@ -66,7 +68,7 @@ mod tests {
             "a😀e\r\n".len() + e_combining
         );
         assert!(map
-            .utf16_position_to_byte(text, TextPosition { line: 0, column: 2 })
+            .utf16_position_to_byte(TextPosition { line: 0, column: 2 })
             .is_err());
     }
 
@@ -95,7 +97,7 @@ mod tests {
                 .collect();
             for offset in 0..=length {
                 let transaction = Transaction::new().insert(offset, "XYZ");
-                let applied = transaction.apply(&source, 0).unwrap();
+                let applied = transaction.apply(&Text::from(&source), 0).unwrap();
                 assert_eq!(
                     applied.change_map.map_offset(offset, Affinity::Before),
                     offset
@@ -115,7 +117,7 @@ mod tests {
     fn selections_preserve_direction_and_map_insertions() {
         let selections = SelectionSet::new([Selection::range(2, 4), Selection::range(8, 5)]);
         let transaction = Transaction::new().insert(3, "xyz");
-        let mapped = selections.map(&transaction.apply("0123456789", 0).unwrap().change_map);
+        let mapped = selections.map(&transaction.apply(&Text::from("0123456789"), 0).unwrap().change_map);
         assert_eq!(mapped.selections()[0], Selection::range(2, 7));
         assert_eq!(mapped.selections()[1], Selection::range(11, 8));
     }
@@ -182,7 +184,7 @@ mod tests {
         let document = Document::new("a😀 café CAFÉ");
         let mut session = SearchSession::new(&document.snapshot(), SearchQuery::new("é"));
         assert_eq!(session.matches().len(), 1);
-        assert_eq!(&document.text()[session.matches()[0].clone()], "é");
+        assert_eq!(document.text().slice(session.matches()[0].clone()), "é");
 
         session
             .set_query(
@@ -192,7 +194,7 @@ mod tests {
             .unwrap();
         assert_eq!(session.matches().len(), 2);
         assert!(session.matches().iter().all(|range| {
-            &document.text()[range.clone()] == "é" || &document.text()[range.clone()] == "É"
+            document.text().slice(range.clone()) == "é" || document.text().slice(range.clone()) == "É"
         }));
     }
 

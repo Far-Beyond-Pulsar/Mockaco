@@ -297,6 +297,10 @@ pub struct DocumentSession {
     location: Option<DocumentLocation>,
     metadata: DocumentMetadata,
     saved_content_hash: u64,
+    /// The text last hashed and its hash, so asking whether the document is
+    /// dirty does not rehash it every time. Keyed by rope identity: version
+    /// numbers repeat after an undo, the rope instance never does.
+    hash_cache: std::cell::RefCell<Option<(crate::Text, u64)>>,
     generation: u64,
     next_save_id: u64,
     pending_saves: HashMap<SaveRequestId, SaveRequest>,
@@ -321,6 +325,7 @@ impl DocumentSession {
             location,
             metadata,
             saved_content_hash,
+            hash_cache: Default::default(),
             generation: 0,
             next_save_id: 1,
             pending_saves: HashMap::new(),
@@ -344,8 +349,21 @@ impl DocumentSession {
         self.editor.snapshot()
     }
 
-    pub fn text(&self) -> &str {
+    pub fn text(&self) -> &crate::Text {
         self.editor.document().text()
+    }
+
+    /// The content hash of the current version, computed once per version.
+    fn current_hash(&self) -> u64 {
+        let text = self.text();
+        if let Some((cached, hash)) = self.hash_cache.borrow().as_ref() {
+            if cached.is_same_instance(text) {
+                return *hash;
+            }
+        }
+        let hash = text_hash(text);
+        *self.hash_cache.borrow_mut() = Some((text.clone(), hash));
+        hash
     }
 
     pub fn generation(&self) -> u64 {
@@ -355,7 +373,7 @@ impl DocumentSession {
     pub fn current_identity(&self) -> ContentIdentity {
         ContentIdentity {
             document_version: self.editor.snapshot().version(),
-            content_hash: content_hash(self.text()),
+            content_hash: self.current_hash(),
         }
     }
 
@@ -470,7 +488,7 @@ impl DocumentSession {
                         .clone()
                         .unwrap_or_else(|| DocumentLocation::new("<unknown>")),
                     identity: self.current_identity(),
-                    text: self.text().to_owned(),
+                    text: self.text().to_string(),
                     metadata: self.metadata.clone(),
                 },
                 current_generation: self.generation,
@@ -598,7 +616,7 @@ impl DocumentSession {
             kind,
             target,
             identity: self.current_identity(),
-            text: self.text().to_owned(),
+            text: self.text().to_string(),
             metadata: self.metadata.clone(),
         };
         self.pending_saves.insert(id, request.clone());
@@ -647,9 +665,21 @@ fn has_trailing_newline(text: &str) -> bool {
 }
 
 fn content_hash(text: &str) -> u64 {
-    text.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+    hash_bytes(CONTENT_HASH_SEED, text.as_bytes())
+}
+
+/// The same hash as [`content_hash`], streamed over a rope's chunks.
+fn text_hash(text: &crate::Text) -> u64 {
+    text.chunks()
+        .fold(CONTENT_HASH_SEED, |hash, chunk| hash_bytes(hash, chunk.as_bytes()))
+}
+
+const CONTENT_HASH_SEED: u64 = 0xcbf29ce484222325;
+
+fn hash_bytes(seed: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(seed, |hash, byte| {
         hash.wrapping_mul(0x100000001b3)
-            .wrapping_add(u64::from(byte))
+            .wrapping_add(u64::from(*byte))
     })
 }
 

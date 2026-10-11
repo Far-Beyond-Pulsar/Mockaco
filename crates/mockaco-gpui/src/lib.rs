@@ -644,7 +644,7 @@ pub struct EditorSurface {
 
 impl EditorSurface {
     pub fn new(
-        text: impl Into<String>,
+        text: impl Into<mockaco_core::Text>,
         display_config: mockaco_renderer::DisplayConfig,
         geometry: SurfaceGeometry,
     ) -> Self {
@@ -652,7 +652,7 @@ impl EditorSurface {
     }
 
     pub fn with_language(
-        text: impl Into<String>,
+        text: impl Into<mockaco_core::Text>,
         display_config: mockaco_renderer::DisplayConfig,
         geometry: SurfaceGeometry,
         language: Language,
@@ -752,7 +752,7 @@ impl EditorSurface {
 
     /// Replaces the surface document for host-driven load/external-change
     /// flows while preserving the current display configuration.
-    pub fn replace_text(&mut self, text: impl Into<String>) {
+    pub fn replace_text(&mut self, text: impl Into<mockaco_core::Text>) {
         self.editor = EditorState::new(text);
         let snapshot = self.editor.snapshot();
         let config = self.display.config().clone();
@@ -844,19 +844,16 @@ impl EditorSurface {
             return false;
         }
         let is_word = |character: char| character.is_alphanumeric() || character == '_';
-        let start = text[..byte]
-            .char_indices()
-            .rev()
+        let start = text
+            .chars_before(byte)
             .take_while(|(_, character)| is_word(*character))
             .last()
             .map_or(byte, |(offset, _)| offset);
-        let end = text[byte..]
-            .char_indices()
+        let end = text
+            .chars_from(byte)
             .take_while(|(_, character)| is_word(*character))
             .last()
-            .map_or(byte, |(offset, character)| {
-                byte + offset + character.len_utf8()
-            });
+            .map_or(byte, |(offset, character)| offset + character.len_utf8());
         let range = if start == end { byte..byte } else { start..end };
         self.editor
             .set_selections(SelectionSet::new([Selection::range(
@@ -890,7 +887,7 @@ impl EditorSurface {
         let selected = selections
             .iter()
             .filter(|selection| !selection.is_caret())
-            .map(|selection| text[selection.ordered_range()].to_owned())
+            .map(|selection| text.slice(selection.ordered_range()).into_owned())
             .collect::<Vec<_>>();
         if !selected.is_empty() {
             return selected.join("\n");
@@ -911,7 +908,7 @@ impl EditorSurface {
                     .line_start(line)
                     .ok()?;
                 let end = self.editor.document().position_map().line_end(line).ok()?;
-                Some(text[start..end].to_owned())
+                Some(text.slice(start..end).into_owned())
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -1117,15 +1114,17 @@ impl EditorSurface {
             .selections()
             .primary()
             .and_then(|selection| position_map.byte_to_line(selection.cursor()).ok());
-        let rows = render_range
-            .clone()
-            .map(|display_row| {
-                let row = &self.display.rows()[display_row];
+        let rows = self
+            .display
+            .rows_in(render_range.clone())
+            .into_iter()
+            .zip(render_range.clone())
+            .map(|(row, display_row)| {
                 PaintRow {
                     display_row,
                     buffer_line: row.buffer_line,
                     source_range: row.start_byte..row.end_byte,
-                    text: text[row.start_byte..row.end_byte].to_owned(),
+                    text: text.slice(row.start_byte..row.end_byte).into_owned(),
                     y: display_y(display_row, self.scroll.top_row, self.geometry.line_height),
                     height: self.geometry.line_height,
                     continuation: row.continuation,
@@ -1328,15 +1327,20 @@ impl EditorSurface {
             return;
         }
         let document_version = self.display.snapshot().version();
-        let rows = self.display.rows();
-        if rows.is_empty() {
+        let display = &self.display;
+        let row_count = display.row_count();
+        if row_count == 0 {
             return;
         }
         let viewport = self.scroll.viewport_rows.max(1);
-        let top = self.scroll.top_row.min(rows.len() - 1);
+        let top = self.scroll.top_row.min(row_count - 1);
         let byte_range = |start_row: usize, end_row: usize| {
-            let end_row = end_row.clamp(start_row + 1, rows.len());
-            rows[start_row].start_byte..rows[end_row - 1].end_byte
+            let end_row = end_row.clamp(start_row + 1, row_count);
+            let start = display.row(start_row).map_or(0, |row| row.start_byte);
+            let end = display
+                .row(end_row - 1)
+                .map_or(start, |row| row.end_byte);
+            start..end
         };
         // The painted rows plus a screen of lookahead each way.
         let wanted = byte_range(
@@ -1481,7 +1485,7 @@ pub struct DiffSplitSurface {
 }
 
 impl DiffSplitSurface {
-    pub fn new(original: &DocumentSnapshot, modified_text: impl Into<String>) -> Self {
+    pub fn new(original: &DocumentSnapshot, modified_text: impl Into<mockaco_core::Text>) -> Self {
         let editor = DiffEditor::new(original, modified_text);
         let scroll =
             DiffScrollState::new(DiffScrollMode::Synchronized, editor.diff().rows().len(), 0);
@@ -1654,11 +1658,11 @@ fn char_class(character: char) -> CharClass {
 
 /// Next word boundary from `from`: skip whitespace, then one run of a single
 /// character class.
-fn word_boundary(text: &str, from: usize, forward: bool) -> usize {
+fn word_boundary(text: &mockaco_core::Text, from: usize, forward: bool) -> usize {
     let from = from.min(text.len());
     if forward {
         let mut index = from;
-        let mut chars = text[from..].chars().peekable();
+        let mut chars = text.chars_from(from).map(|(_, c)| c).peekable();
         while let Some(character) = chars.next_if(|c| char_class(*c) == CharClass::Space) {
             index += character.len_utf8();
         }
@@ -1670,7 +1674,7 @@ fn word_boundary(text: &str, from: usize, forward: bool) -> usize {
         index
     } else {
         let mut index = from;
-        let mut chars = text[..from].chars().rev().peekable();
+        let mut chars = text.chars_before(from).map(|(_, c)| c).peekable();
         while let Some(character) = chars.next_if(|c| char_class(*c) == CharClass::Space) {
             index -= character.len_utf8();
         }
@@ -1804,7 +1808,7 @@ impl InputRouter {
         &mut self,
         surface: &mut EditorSurface,
         extend: bool,
-        target: impl Fn(&str, usize) -> usize,
+        target: impl Fn(&mockaco_core::Text, usize) -> usize,
     ) -> Result<InputOutcome, SurfaceError> {
         let text = surface.editor.document().text();
         let next = surface
@@ -1880,13 +1884,19 @@ impl InputRouter {
             let range = selection.ordered_range();
             let line = map.byte_to_line(range.start).unwrap_or(0);
             let line_start = map.line_start(line).unwrap_or(0);
-            let before_caret = &text[line_start..range.start];
-            let leading: String = before_caret
-                .chars()
-                .take_while(|c| *c == ' ' || *c == '\t')
+            // Only the indentation and the characters next to the caret are
+            // read, however long the line is.
+            let leading: String = text
+                .chars_from(line_start)
+                .take_while(|(offset, c)| *offset < range.start && (*c == ' ' || *c == '\t'))
+                .map(|(_, c)| c)
                 .collect();
-            let before = before_caret.trim_end().chars().last();
-            let after = text[range.end..].chars().next();
+            let before = text
+                .chars_before(range.start)
+                .take_while(|(offset, _)| *offset >= line_start)
+                .map(|(_, c)| c)
+                .find(|c| !c.is_whitespace());
+            let after = text.char_at(range.end);
             let opens = matches!(before, Some('{' | '(' | '['));
             let closes = matches!(
                 (before, after),
@@ -1945,8 +1955,10 @@ impl InputRouter {
                 let range = selection.ordered_range();
                 let line = map.byte_to_line(range.start).unwrap_or(0);
                 let line_start = map.line_start(line).unwrap_or(0);
-                let column = text[line_start..range.start]
-                    .chars()
+                let column = text
+                    .chars_from(line_start)
+                    .take_while(|(offset, _)| *offset < range.start)
+                    .map(|(_, c)| c)
                     .fold(0, |column, c| {
                         column + if c == '\t' { width - column % width } else { 1 }
                     });
@@ -2013,11 +2025,11 @@ impl InputRouter {
             .iter()
             .filter_map(|line| {
                 let start = map.line_start(*line).ok()?;
-                let leading = &text[start..];
-                let removable = if leading.starts_with('\t') {
+                let mut leading = text.chars_from(start).map(|(_, c)| c).peekable();
+                let removable = if leading.peek() == Some(&'\t') {
                     1
                 } else {
-                    leading.bytes().take(width).take_while(|b| *b == b' ').count()
+                    leading.take(width).take_while(|c| *c == ' ').count()
                 };
                 (removable > 0).then(|| Edit::delete(start..start + removable))
             })
@@ -2174,14 +2186,11 @@ impl InputRouter {
                 return Some(range);
             }
             if backward {
-                text[..selection.head]
-                    .char_indices()
-                    .next_back()
+                text.chars_before(selection.head)
+                    .next()
                     .map(|(offset, _)| offset..selection.head)
             } else {
-                text[selection.head..]
-                    .chars()
-                    .next()
+                text.char_at(selection.head)
                     .map(|character| selection.head..selection.head + character.len_utf8())
             }
         });
@@ -2231,7 +2240,7 @@ impl InputRouter {
                 .line_end(line)
                 .unwrap_or(selection.cursor());
             if end < text.len() {
-                end += text[end..].chars().next().map_or(0, char::len_utf8);
+                end += text.char_at(end).map_or(0, char::len_utf8);
             }
             if start != end {
                 edits.push(Edit::delete(start..end));
@@ -2277,15 +2286,12 @@ impl InputRouter {
                     selection.head
                 };
                 let target = if right {
-                    text[cursor..]
-                        .chars()
-                        .next()
+                    text.char_at(cursor)
                         .map(|character| cursor + character.len_utf8())
                         .unwrap_or(cursor)
                 } else {
-                    text[..cursor]
-                        .char_indices()
-                        .next_back()
+                    text.chars_before(cursor)
+                        .next()
                         .map(|(offset, _)| offset)
                         .unwrap_or(0)
                 };
@@ -2331,8 +2337,7 @@ impl InputRouter {
             let target_column = (*desired).min(
                 surface
                     .display
-                    .rows()
-                    .get(row)
+                    .row(row)
                     .map_or(0, |display_row| display_row.display_width),
             );
             let target = surface
@@ -2380,7 +2385,7 @@ impl InputRouter {
                     .buffer_to_display(selection.head, Affinity::After)
                     .ok()
                     .and_then(|point| {
-                        let row = &surface.display.rows()[point.row];
+                        let row = surface.display.row(point.row)?;
                         surface
                             .display
                             .display_to_buffer(
@@ -2495,7 +2500,9 @@ impl InputRouter {
                         }
                     } else if x >= GUTTER_MARKER_WIDTH {
                         // Line-number column: select the whole line.
-                        let line = surface.display.rows()[row].buffer_line;
+                        let Some(line) = surface.display.row(row).map(|row| row.buffer_line) else {
+                            return Ok(InputOutcome::handled());
+                        };
                         surface.select_line_at(line);
                         self.drag_anchor = None;
                         return Ok(InputOutcome {
@@ -2594,7 +2601,7 @@ fn mouse_to_byte(surface: &EditorSurface, x: f32, y: f32) -> Result<usize, Surfa
     // glyph places the caret after it.
     let column = ((code_x / surface.geometry.character_width.max(1.0)) + 0.5).floor() as usize
         + surface.scroll.horizontal_columns;
-    let column = column.min(surface.display.rows()[row].display_width);
+    let column = column.min(surface.display.row(row).map_or(0, |row| row.display_width));
     surface
         .display
         .display_to_buffer(DisplayPoint { row, column }, Affinity::Before)
@@ -2602,14 +2609,21 @@ fn mouse_to_byte(surface: &EditorSurface, x: f32, y: f32) -> Result<usize, Surfa
         .map_err(SurfaceError::Display)
 }
 
-fn indent_guides_for_line(text: &str, start: usize, end: usize, tab_width: usize) -> Vec<usize> {
-    let Some(line) = text.get(start.min(text.len())..end.min(text.len())) else {
+/// Indent guide columns for the line `start..end` of `text`. Reads only the
+/// leading whitespace, however long the line is.
+fn indent_guides_for_line(text: &mockaco_core::Text, start: usize, end: usize, tab_width: usize) -> Vec<usize> {
+    let end = end.min(text.len());
+    if start > end || !text.is_char_boundary(start) {
         return Vec::new();
-    };
+    }
     let tab_width = tab_width.max(1);
     let mut column = 0;
     let mut first_code_column = None;
-    for character in line.chars() {
+    for character in text
+        .chars_from(start)
+        .take_while(|(offset, _)| *offset < end)
+        .map(|(_, character)| character)
+    {
         match character {
             ' ' => column += 1,
             '\t' => column += tab_width - (column % tab_width),
@@ -3016,9 +3030,9 @@ mod tests {
         assert!(frame.rows.len() <= 22);
         assert_eq!(frame.rows.len(), frame.gutter.rows.len());
         assert!(frame.rows.iter().any(|row| !row.tokens.is_empty()));
-        // Only the padded viewport window is highlighted, never the whole
-        // 40k-line document (which would hold hundreds of thousands).
-        assert!(surface.highlights.tokens().len() < 3_000);
+        // At most a couple of padded windows (the first one may still be
+        // cached), never the whole document (~400k tokens).
+        assert!(surface.highlights.tokens().len() < 10_000);
         assert!(frame.decorations.iter().all(|decoration| frame
             .rows
             .iter()

@@ -4,7 +4,7 @@
 //! ranges. Parser implementations, including a future Tree-sitter adapter,
 //! can live outside this crate without leaking parser types into the editor.
 
-use mockaco_core::{AppliedTransaction, ChangeMap, DocumentSnapshot};
+use mockaco_core::{AppliedTransaction, ChangeMap, DocumentSnapshot, Text};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
@@ -488,7 +488,7 @@ impl RustTreeSitterProvider {
                 .set_included_ranges(&[tree_sitter_range(after, mapped_window.clone())])
                 .map_err(|error| LanguageError::Provider(error.to_string()))?;
             let old_tree = state.tree.take();
-            state.tree = state.parser.parse(after.text(), old_tree.as_ref());
+            state.tree = parse_text(&mut state.parser, after.text(), old_tree.as_ref());
             state.parsed_range = Some(mapped_window);
         } else {
             state
@@ -496,7 +496,7 @@ impl RustTreeSitterProvider {
                 .set_included_ranges(&[tree_sitter_range(after, requested_range.clone())])
                 .map_err(|error| LanguageError::Provider(error.to_string()))?;
             state.tree = None;
-            state.tree = state.parser.parse(after.text(), None);
+            state.tree = parse_text(&mut state.parser, after.text(), None);
             state.parsed_range = Some(requested_range.clone());
         }
         state.version = Some(after.version());
@@ -527,7 +527,7 @@ impl RustTreeSitterProvider {
                 .set_included_ranges(&[tree_sitter_range(snapshot, requested_range.clone())])
                 .map_err(|error| LanguageError::Provider(error.to_string()))?;
             state.tree = None;
-            state.tree = state.parser.parse(snapshot.text(), None);
+            state.tree = parse_text(&mut state.parser, snapshot.text(), None);
             state.parsed_range = Some(requested_range);
             state.version = Some(snapshot.version());
         }
@@ -556,7 +556,7 @@ impl RustTreeSitterProvider {
         let mut captures = cursor.captures(
             &self.highlights,
             tree.root_node(),
-            snapshot.text().as_bytes(),
+            |node: tree_sitter::Node<'_>| snapshot.text().byte_chunks_in(node.byte_range()),
         );
         while let Some(capture) = captures.next() {
             let query_capture = capture.0.captures[capture.1];
@@ -598,7 +598,7 @@ impl SyntaxHighlightProvider for RustTreeSitterProvider {
                 .set_included_ranges(&[tree_sitter_range(snapshot, requested_range.clone())])
                 .map_err(|error| LanguageError::Provider(error.to_string()))?;
             state.tree = None;
-            state.tree = state.parser.parse(snapshot.text(), None);
+            state.tree = parse_text(&mut state.parser, snapshot.text(), None);
             state.parsed_range = Some(requested_range);
             state.version = Some(snapshot.version());
         }
@@ -626,17 +626,47 @@ pub struct VersionedFoldResult {
     pub ranges: Vec<FoldRange>,
 }
 
-fn clamp_range(text: &str, range: Range<usize>) -> Range<usize> {
-    let start = range.start.min(text.len());
-    let end = range.end.min(text.len()).max(start);
+fn clamp_range(text: &Text, range: Range<usize>) -> Range<usize> {
+    clamp_to_boundaries(text.len(), |offset| text.is_char_boundary(offset), range)
+}
+
+/// [`clamp_range`] for a plain string (the lexer's window).
+fn clamp_str_range(text: &str, range: Range<usize>) -> Range<usize> {
+    clamp_to_boundaries(text.len(), |offset| text.is_char_boundary(offset), range)
+}
+
+fn clamp_to_boundaries(
+    len: usize,
+    is_char_boundary: impl Fn(usize) -> bool,
+    range: Range<usize>,
+) -> Range<usize> {
+    let start = range.start.min(len);
+    let end = range.end.min(len).max(start);
     let start = (0..=start)
         .rev()
-        .find(|offset| text.is_char_boundary(*offset))
+        .find(|offset| is_char_boundary(*offset))
         .unwrap_or(0);
-    let end = (end..=text.len())
-        .find(|offset| text.is_char_boundary(*offset))
-        .unwrap_or(text.len());
+    let end = (end..=len)
+        .find(|offset| is_char_boundary(*offset))
+        .unwrap_or(len);
     start..end
+}
+
+/// Parses `text` straight from the rope's chunks: no contiguous copy of the
+/// document is ever made.
+fn parse_text(parser: &mut Parser, text: &Text, old_tree: Option<&tree_sitter::Tree>) -> Option<tree_sitter::Tree> {
+    let len = text.len();
+    parser.parse_with_options(
+        &mut |byte: usize, _: Point| -> &[u8] {
+            if byte >= len {
+                return &[];
+            }
+            let (chunk, start) = text.chunk_at(byte);
+            &chunk.as_bytes()[byte - start..]
+        },
+        old_tree,
+        None,
+    )
 }
 
 /// Expands a requested paint range by one line on either side. Tree-sitter is
@@ -1038,7 +1068,7 @@ mod tests {
             map_range(
                 &Transaction::new()
                     .insert(1, "x")
-                    .apply("abc", 0)
+                    .apply(&Text::from("abc"), 0)
                     .unwrap()
                     .change_map,
                 1..3

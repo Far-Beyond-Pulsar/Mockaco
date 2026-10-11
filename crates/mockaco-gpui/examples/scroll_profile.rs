@@ -112,8 +112,8 @@ fn main() {
                 let map = snapshot.position_map();
                 (layout.first_line..layout.last_line)
                     .map(|line| {
-                        let text = &snapshot.text()[map.line_start(line).unwrap()..map.line_end(line).unwrap()];
-                        chrome::minimap_line(text, comment).len()
+                        let text = snapshot.text().line(line).unwrap();
+                        chrome::minimap_line(&text, comment).len()
                     })
                     .sum::<usize>()
             });
