@@ -76,7 +76,9 @@ impl Document {
         }
     }
 
-    pub(crate) fn snapshot_with_version(text: Text, version: u64) -> DocumentSnapshot {
+    /// A snapshot of `text` stamped with `version`, for callers that manage
+    /// their own version numbers (parser caches key on them).
+    pub fn snapshot_with_version(text: Text, version: u64) -> DocumentSnapshot {
         DocumentSnapshot {
             data: Arc::new(DocumentData { text, version }),
         }
