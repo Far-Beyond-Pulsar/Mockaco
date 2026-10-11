@@ -303,6 +303,14 @@ impl WgpuiEditorView {
         }
     }
 
+    /// Number of entries in the open completion menu (0 when closed).
+    pub fn completion_len(&self) -> usize {
+        self.intel
+            .completion
+            .as_ref()
+            .map_or(0, |session| session.borrow().len())
+    }
+
     /// Opens completion at the caret (Ctrl+Space).
     pub fn trigger_completion(&mut self, cx: &mut Context<Self>) {
         if self.intel.enabled && !self.read_only {
