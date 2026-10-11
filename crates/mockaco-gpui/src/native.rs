@@ -24,11 +24,13 @@ use mockaco_renderer::{
 use std::collections::HashMap;
 use std::time::Instant;
 use wgpui::{
-    div, fill, font, point, px, size, App, Bounds, ClipboardItem, ContentMask, Context, Corners,
+    canvas, div, fill, font, inflate_for_buffer, point, prepare_scroll_buffer, px, size,
+    with_buffer_mask, App, Bounds, ClipboardItem, ContentMask, Context, Corners,
     CursorStyle, DispatchPhase, Element, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
     Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, GlobalElementId, Hitbox,
     HitboxBehavior, Hsla, InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent,
-    LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathBuilder, Pixels,
+    LayerPolicy, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+    PathBuilder, Pixels, ScrollBufferFrame, StatefulInteractiveElement,
     Point, Render, Rgba, ScrollDelta, ScrollWheelEvent, SharedString, Size, Style, Styled,
     TextRun, Window,
 };
@@ -100,6 +102,8 @@ pub struct WgpuiEditorView {
     line_height: f32,
     char_width: f32,
     background: Hsla,
+    /// Bumped when the theme changes, so cached layers repaint.
+    theme_revision: u64,
     y_scroll: SmoothScroll,
     x_scroll: SmoothScroll,
     last_frame: Option<Instant>,
@@ -134,6 +138,7 @@ impl WgpuiEditorView {
         let geometry = surface.geometry();
         Self {
             background: hsla(surface.theme().background),
+            theme_revision: 0,
             surface,
             input_router: InputRouter::default(),
             read_only,
@@ -182,6 +187,7 @@ impl WgpuiEditorView {
         if self.surface.theme() != theme {
             self.background = hsla(theme.background);
             self.surface.set_theme(theme);
+            self.theme_revision = self.theme_revision.wrapping_add(1);
             cx.notify();
         }
     }
@@ -923,6 +929,42 @@ impl WgpuiEditorView {
     }
 
     // ---- paint data ------------------------------------------------------
+    /// The minimap runs of display rows `rows`, reading only those lines
+    /// (and at most what the minimap can show of each).
+    fn minimap_rows(&self, rows: std::ops::Range<usize>) -> Vec<(usize, Vec<MinimapRun>)> {
+        let display = self.surface.display();
+        let snapshot = self.surface.document();
+        let text = snapshot.text();
+        let comment = self.surface.language().line_comment();
+        display
+            .rows_in(rows.clone())
+            .into_iter()
+            .zip(rows)
+            .filter(|(row, _)| !row.continuation)
+            .filter_map(|(row, index)| {
+                let end = text.line_end(row.buffer_line).ok()?;
+                let source: String = text
+                    .chars_from(row.start_byte)
+                    .take_while(|(offset, _)| *offset < end)
+                    .take(MINIMAP_MAX_COLUMNS * 2)
+                    .map(|(_, c)| c)
+                    .collect();
+                Some((index, chrome::minimap_line(&source, comment)))
+            })
+            .collect()
+    }
+
+    /// What the minimap's content depends on, scroll excepted: while this is
+    /// unchanged its buffered layer only shifts.
+    fn minimap_key(&self) -> (u64, u64, u64, &'static str) {
+        (
+            self.surface.document().version(),
+            self.surface.display().revision(),
+            self.theme_revision,
+            self.surface.language().id(),
+        )
+    }
+
 
     fn paint_data(&self, focused: bool) -> PaintData {
         let frame = self.surface.render_frame_with_buffer(1);
@@ -934,34 +976,6 @@ impl WgpuiEditorView {
             .iter()
             .map(|row| self.line_backgrounds.get(&row.buffer_line).copied())
             .collect();
-        let minimap = (self.layout.minimap_width > 0.0).then(|| {
-            let layout = self.minimap_layout();
-            let display = self.surface.display();
-            let snapshot = self.surface.document();
-            let map = snapshot.position_map();
-            let text = snapshot.text();
-            let comment = self.surface.language().line_comment();
-            // Only the lines the minimap shows are read, whatever the
-            // document's length.
-            let lines = (layout.first_line..layout.last_line)
-                .filter_map(|row| {
-                    let line = display.row(row)?.buffer_line;
-                    let (start, end) = (map.line_start(line).ok()?, map.line_end(line).ok()?);
-                    // At most what the minimap can show of the line.
-                    let source: String = text
-                        .chars_from(start)
-                        .take_while(|(offset, _)| *offset < end)
-                        .take(MINIMAP_MAX_COLUMNS * 2)
-                        .map(|(_, c)| c)
-                        .collect();
-                    Some((
-                        row as f32 * MINIMAP_LINE_HEIGHT - layout.content_offset,
-                        chrome::minimap_line(&source, comment),
-                    ))
-                })
-                .collect();
-            MinimapPaint { layout, lines }
-        });
         PaintData {
             layout: self.layout,
             frame,
@@ -980,16 +994,9 @@ impl WgpuiEditorView {
             dragging: self.drag,
             vthumb: self.vertical_thumb(),
             hthumb: self.horizontal_thumb(),
-            minimap,
             always_show_fold_controls: self.always_show_fold_controls,
         }
     }
-}
-
-struct MinimapPaint {
-    layout: MinimapLayout,
-    /// `(y, runs)` for each visible minimap row.
-    lines: Vec<(f32, Vec<MinimapRun>)>,
 }
 
 struct PaintData {
@@ -1010,13 +1017,14 @@ struct PaintData {
     dragging: Drag,
     vthumb: Option<Thumb>,
     hthumb: Option<Thumb>,
-    minimap: Option<MinimapPaint>,
     always_show_fold_controls: bool,
 }
 
 impl Render for WgpuiEditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let editor = cx.entity();
+        let layout = self.layout;
+        let mut root = div()
             .size_full()
             .relative()
             .overflow_hidden()
@@ -1025,8 +1033,33 @@ impl Render for WgpuiEditorView {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(EditorElement {
-                editor: cx.entity(),
-            })
+                editor: editor.clone(),
+            });
+        if layout.minimap_width > 0.0 {
+            // Half the minimap's height pre-rendered above and below.
+            let margin = (layout.viewport_height * 0.5).floor().max(0.0);
+            let place = |element: wgpui::Div| {
+                element
+                    .absolute()
+                    .top_0()
+                    .right(px(VBAR_WIDTH))
+                    .w(px(layout.minimap_width))
+                    .h(px(layout.viewport_height))
+            };
+            root = root
+                .child(
+                    place(div())
+                        .id("mockaco-minimap")
+                        .layer_keyed(self.minimap_key())
+                        .layer_with_policy(LayerPolicy {
+                            overdraw_margin: size(px(0.), px(margin)),
+                            ..LayerPolicy::default()
+                        })
+                        .child(minimap_canvas(editor.clone())),
+                )
+                .child(place(div()).child(minimap_overlay(editor)));
+        }
+        root
     }
 }
 
@@ -1370,9 +1403,6 @@ fn paint_editor(data: &PaintData, bounds: Bounds<Pixels>, window: &mut Window, c
 
     paint_gutter(data, origin, window);
     paint_gutter_numbers(data, origin, window, cx);
-    if let Some(minimap) = &data.minimap {
-        paint_minimap(data, minimap, origin, window);
-    }
     paint_scrollbars(data, origin, window);
 }
 
@@ -1566,47 +1596,113 @@ fn minimap_tone_color(theme: &SurfaceTheme, tone: MinimapTone) -> SurfaceColor {
     }
 }
 
-fn paint_minimap(data: &PaintData, minimap: &MinimapPaint, origin: Point<Pixels>, window: &mut Window) {
-    let layout = data.layout;
-    let theme = &data.frame.theme;
-    let clip = rect(
-        origin,
-        layout.minimap_left,
-        0.0,
-        layout.minimap_width,
-        layout.viewport_height,
-    );
-    window.with_content_mask(mask(clip), |window| {
-        window.paint_quad(fill(
-            rect(origin, layout.minimap_left, 0.0, 1.0, layout.viewport_height),
-            hsla(with_alpha(theme.foreground, 18)),
-        ));
-        for (y, runs) in &minimap.lines {
-            for run in runs {
+/// The minimap's lines, for one frame of its buffered layer.
+struct MinimapDraw {
+    /// Minimap content scroll, in px.
+    offset: f32,
+    /// How far past the bounds this frame draws (zero for a viewport frame).
+    margin: f32,
+    rows: Vec<(usize, Vec<MinimapRun>)>,
+    theme: SurfaceTheme,
+}
+
+/// The minimap's content, drawn into an overscroll-buffered layer.
+///
+/// The layer's texture covers the minimap plus half its height above and
+/// below. Scrolling only shifts that texture; the lines are redrawn once the
+/// shift passes half the margin (a quarter of the height), re-centred on the
+/// current position, so a refill always lands before the edge of the
+/// pre-rendered area comes into view. Nothing ever scrolls past the
+/// document's bounds: the margin is only pre-rendered content.
+fn minimap_canvas(editor: Entity<WgpuiEditorView>) -> impl IntoElement {
+    canvas(
+        move |bounds, window, cx| {
+            let view = editor.read(cx);
+            let layout = view.minimap_layout();
+            let offset = layout.content_offset;
+            let margin = match prepare_scroll_buffer(window, bounds, point(px(0.), px(-offset))) {
+                ScrollBufferFrame::Skip => return None,
+                ScrollBufferFrame::Buffer { margin } => margin.height.to_f32(),
+                ScrollBufferFrame::Viewport => 0.0,
+            };
+            let height = bounds.size.height.to_f32();
+            let row_count = view.surface.display().row_count();
+            let first = ((offset - margin) / MINIMAP_LINE_HEIGHT).floor().max(0.0) as usize;
+            let last = ((((offset + height + margin) / MINIMAP_LINE_HEIGHT).ceil() as usize) + 1)
+                .min(row_count)
+                .max(first);
+            Some(MinimapDraw {
+                offset,
+                margin,
+                rows: view.minimap_rows(first..last),
+                theme: view.surface.theme(),
+            })
+        },
+        move |bounds, draw, window, _cx| {
+            let Some(draw) = draw else {
+                return;
+            };
+            let buffered = draw.margin > 0.0;
+            let mask_bounds = if buffered {
+                inflate_for_buffer(bounds, size(px(0.), px(draw.margin)))
+            } else {
+                bounds
+            };
+            let content_mask = ContentMask {
+                bounds: mask_bounds,
+            };
+            let buffer_mask = buffered.then(|| content_mask.clone());
+            window.with_content_mask(Some(content_mask), |window| {
+                with_buffer_mask(window, buffer_mask, |window| {
+                    for (row, runs) in &draw.rows {
+                        let y = *row as f32 * MINIMAP_LINE_HEIGHT - draw.offset;
+                        for run in runs {
+                            window.paint_quad(fill(
+                                rect(
+                                    bounds.origin,
+                                    MINIMAP_PADDING + run.start as f32 * MINIMAP_CHAR_WIDTH,
+                                    y,
+                                    run.len as f32 * MINIMAP_CHAR_WIDTH,
+                                    MINIMAP_LINE_HEIGHT - 0.5,
+                                ),
+                                hsla(minimap_tone_color(&draw.theme, run.tone)),
+                            ));
+                        }
+                    }
+                });
+            });
+        },
+    )
+    .size_full()
+}
+
+/// The minimap's edge and its viewport slider. Drawn over the buffered
+/// minimap every frame: the slider moves with every scroll, so it must not
+/// live in the cached texture.
+fn minimap_overlay(editor: Entity<WgpuiEditorView>) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, cx| {
+            let view = editor.read(cx);
+            let layout = view.minimap_layout();
+            let theme = view.surface.theme();
+            let active =
+                matches!(view.drag, Drag::Minimap { .. }) || view.hover == Region::Minimap;
+            let origin = bounds.origin;
+            let width = bounds.size.width.to_f32();
+            window.with_content_mask(mask(bounds), |window| {
                 window.paint_quad(fill(
-                    rect(
-                        origin,
-                        layout.minimap_left + MINIMAP_PADDING + run.start as f32 * MINIMAP_CHAR_WIDTH,
-                        *y,
-                        run.len as f32 * MINIMAP_CHAR_WIDTH,
-                        MINIMAP_LINE_HEIGHT - 0.5,
-                    ),
-                    hsla(minimap_tone_color(theme, run.tone)),
+                    rect(origin, 0.0, 0.0, 1.0, bounds.size.height.to_f32()),
+                    hsla(with_alpha(theme.foreground, 18)),
                 ));
-            }
-        }
-        let active = matches!(data.dragging, Drag::Minimap { .. }) || data.hover == Region::Minimap;
-        window.paint_quad(fill(
-            rect(
-                origin,
-                layout.minimap_left,
-                minimap.layout.slider_top,
-                layout.minimap_width,
-                minimap.layout.slider_height,
-            ),
-            hsla(with_alpha(theme.foreground, if active { 38 } else { 22 })),
-        ));
-    });
+                window.paint_quad(fill(
+                    rect(origin, 0.0, layout.slider_top, width, layout.slider_height),
+                    hsla(with_alpha(theme.foreground, if active { 38 } else { 22 })),
+                ));
+            });
+        },
+    )
+    .size_full()
 }
 
 fn paint_scrollbars(data: &PaintData, origin: Point<Pixels>, window: &mut Window) {
