@@ -592,3 +592,78 @@ mod row_text_tests {
         assert_eq!(tabbed.text, "  ab");
     }
 }
+
+/// Pre-computed minimap content with an overscroll buffer.
+///
+/// The rows covering the minimap's height plus half that height above and
+/// half below are derived once and kept. Each frame only shifts them by how
+/// far the minimap has scrolled since; they are rebuilt, re-centred, once
+/// the shift passes a quarter of the height (halfway into the margin) or the
+/// content changes. The margin is only pre-computed content: the minimap
+/// never scrolls past the document, and rows outside it are simply absent.
+#[derive(Debug, Clone)]
+pub struct MinimapBuffer<K> {
+    key: K,
+    /// Minimap scroll (px) the rows were built around.
+    anchor: f32,
+    height: f32,
+    /// `(display row, runs)` for every row in the buffered span.
+    pub rows: Vec<(usize, Vec<MinimapRun>)>,
+}
+
+impl<K: PartialEq + Clone> MinimapBuffer<K> {
+    /// Whether this buffer can serve scroll `offset` for a minimap `height`
+    /// tall whose content is `key`.
+    pub fn serves(&self, key: &K, offset: f32, height: f32) -> bool {
+        self.key == *key
+            && (self.height - height).abs() < 0.5
+            && (offset - self.anchor).abs() <= height * 0.25
+    }
+
+    /// The display rows a buffer built at `offset` covers: the visible span
+    /// plus half the height above and below, clamped to the document.
+    pub fn span(offset: f32, height: f32, row_count: usize) -> std::ops::Range<usize> {
+        let margin = height * 0.5;
+        let first = ((offset - margin) / MINIMAP_LINE_HEIGHT).floor().max(0.0) as usize;
+        let last = (((offset + height + margin) / MINIMAP_LINE_HEIGHT).ceil() as usize + 1)
+            .min(row_count);
+        first.min(last)..last
+    }
+
+    pub fn new(key: K, offset: f32, height: f32, rows: Vec<(usize, Vec<MinimapRun>)>) -> Self {
+        Self {
+            key,
+            anchor: offset,
+            height,
+            rows,
+        }
+    }
+}
+
+#[cfg(test)]
+mod minimap_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn refills_only_past_a_quarter_of_the_height() {
+        let buffer = MinimapBuffer::new(1u64, 1000.0, 400.0, Vec::new());
+        assert!(buffer.serves(&1, 1000.0, 400.0));
+        assert!(buffer.serves(&1, 1100.0, 400.0), "100 px is within 25%");
+        assert!(buffer.serves(&1, 900.0, 400.0), "both directions");
+        assert!(!buffer.serves(&1, 1101.0, 400.0), "past 25% refills");
+        assert!(!buffer.serves(&2, 1000.0, 400.0), "content changed");
+        assert!(!buffer.serves(&1, 1000.0, 300.0), "resized");
+    }
+
+    #[test]
+    fn span_covers_half_a_height_each_side_within_the_document() {
+        // At 1000 px the top row is 500; 400 px tall at 2 px/row shows 200
+        // rows, and 100 more are kept on each side: rows 400..800.
+        let span = MinimapBuffer::<u64>::span(1000.0, 400.0, 100_000);
+        assert_eq!(span.start, 400);
+        assert!((800..=802).contains(&span.end));
+        // Never above the first row or past the last.
+        assert_eq!(MinimapBuffer::<u64>::span(0.0, 400.0, 100_000).start, 0);
+        assert_eq!(MinimapBuffer::<u64>::span(1000.0, 400.0, 50).end, 50);
+    }
+}
