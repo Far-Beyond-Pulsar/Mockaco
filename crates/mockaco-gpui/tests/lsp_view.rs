@@ -145,3 +145,37 @@ fn trigger_characters_request_completion() {
 fn a_single_colon_is_not_a_trigger() {
     assert_eq!(requested_after_typing(&[":"], "let x"), None);
 }
+
+#[test]
+fn server_registered_triggers_open_completion() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = cx.add_window_view(|_window, cx| {
+        let surface = EditorSurface::with_language(
+            "fn f<T>(x: &T) -> &",
+            Default::default(),
+            SurfaceGeometry::default(),
+            Language::Rust,
+        );
+        let mut view = WgpuiEditorView::new(surface, cx);
+        view.set_language_intelligence(true, cx);
+        view.set_completion_triggers(vec!['\'']);
+        view
+    });
+    cx.update(|window, app| {
+        let handle = wgpui::Focusable::focus_handle(view.read(app), app);
+        window.focus(&handle, app);
+    });
+    let mut events = cx.events::<EditorEvent, _>(&view);
+    cx.simulate_input("'");
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+    let mut asked = None;
+    while let Ok(event) = events.try_recv() {
+        if let EditorEvent::CompletionRequested { trigger, .. } = event {
+            asked = Some(trigger);
+        }
+    }
+    assert_eq!(asked, Some(Some('\'')));
+    // Without the registration the same character does nothing.
+    assert_eq!(requested_after_typing(&["'"], "x"), None);
+}
