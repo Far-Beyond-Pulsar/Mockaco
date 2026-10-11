@@ -19,7 +19,9 @@ use crate::{
     MouseButton, MouseEvent, PaintRow, RenderFrame, SurfaceColor, SurfaceGeometry, SurfaceTheme,
     CODE_PADDING, GUTTER_FOLD_WIDTH, GUTTER_MARKER_WIDTH,
 };
-use mockaco_core::{Affinity, SelectionSet};
+mod lsp;
+use self::lsp::{EditKind, Intel};
+use mockaco_core::{Affinity, SelectionSet, TextPosition};
 use mockaco_renderer::{
     DIAGNOSTIC_ERROR_STYLE_ID, DIAGNOSTIC_HINT_STYLE_ID, DIAGNOSTIC_INFO_STYLE_ID,
     DIAGNOSTIC_WARNING_STYLE_ID, SEARCH_CURRENT_MATCH_STYLE_ID, SEARCH_MATCH_STYLE_ID,
@@ -57,6 +59,37 @@ pub enum EditorEvent {
     Changed,
     /// The user pressed Ctrl/Cmd+S.
     SaveRequested,
+    /// The pointer rested on a word: answer with [`WgpuiEditorView::show_hover`].
+    HoverRequested(LspRequest),
+    /// Completion is wanted: answer with [`WgpuiEditorView::show_completions`].
+    CompletionRequested {
+        request: LspRequest,
+        /// The typed trigger character (`.`), or `None` when invoked by
+        /// typing a word or by Ctrl+Space.
+        trigger: Option<char>,
+    },
+    /// Go to definition was asked for (Ctrl+click, F12). The host navigates.
+    DefinitionRequested(LspRequest),
+    /// The selected completion has no documentation yet: answer with
+    /// [`WgpuiEditorView::resolve_completion`].
+    CompletionResolveRequested { request: u64, host_data: u64 },
+    /// A completion tagged with `host_data` was accepted. Hosts that resolve
+    /// lazily fetch its extra edits and answer with
+    /// [`WgpuiEditorView::apply_position_edits`].
+    CompletionCommitted { host_data: u64 },
+}
+
+/// A position-based question for a language server, tied to the document
+/// version it was asked against so a late answer can be recognised as stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LspRequest {
+    pub id: u64,
+    /// Version of the document when asked.
+    pub version: u64,
+    /// Byte offset of the position.
+    pub offset: usize,
+    /// Zero-based line and UTF-16 column, as LSP wants them.
+    pub position: TextPosition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +153,7 @@ pub struct WgpuiEditorView {
     /// pointer is over the gutter (false).
     always_show_fold_controls: bool,
     minimap_buffer: Option<Rc<MinimapBuffer<MinimapKey>>>,
+    intel: Intel,
 }
 
 impl EventEmitter<EditorEvent> for WgpuiEditorView {}
@@ -162,6 +196,7 @@ impl WgpuiEditorView {
             line_backgrounds: HashMap::new(),
             always_show_fold_controls: true,
             minimap_buffer: None,
+            intel: Intel::default(),
         }
     }
 
@@ -520,11 +555,19 @@ impl WgpuiEditorView {
         if keyboard {
             self.sync_surface_to_target();
         }
+        let edit_kind = EditKind::of(&event);
         let is_scroll = matches!(event, InputEvent::Scroll { .. });
         match self.input_router.route(&mut self.surface, event) {
             Ok(outcome) => {
                 if outcome.document_changed {
                     cx.emit(EditorEvent::Changed);
+                } else if outcome.selection_changed {
+                    // Moving the caret ends hover and completion.
+                    self.dismiss_hover(cx);
+                    self.close_completion(cx);
+                }
+                if outcome.document_changed {
+                    self.after_edit(edit_kind, cx);
                 }
                 // Only keyboard navigation retargets scrolling; a mouse click
                 // never shifts the view (the paint-time sync restores it).
@@ -548,6 +591,8 @@ impl WgpuiEditorView {
             self.surface.undo()
         };
         if changed {
+            self.dismiss_hover(cx);
+            self.close_completion(cx);
             self.surface.reveal_primary_caret();
             self.retarget_from_surface();
             cx.emit(EditorEvent::Changed);
@@ -564,6 +609,37 @@ impl WgpuiEditorView {
             command: keystroke.modifiers.platform,
         };
         let primary = modifiers.control || modifiers.command;
+        if self.intel.enabled {
+            let name = keystroke.key.as_str();
+            let is_modifier = matches!(
+                name,
+                "shift" | "control" | "alt" | "platform" | "cmd" | "super" | "meta" | "function"
+            );
+            if self.completion_key(
+                name,
+                modifiers.shift,
+                modifiers.control,
+                modifiers.alt,
+                modifiers.command,
+                cx,
+            ) {
+                cx.stop_propagation();
+                return;
+            }
+            if primary && !modifiers.alt && name == "space" {
+                self.trigger_completion(cx);
+                cx.stop_propagation();
+                return;
+            }
+            if name == "f12" {
+                self.request_definition_at_caret(cx);
+                cx.stop_propagation();
+                return;
+            }
+            if !is_modifier {
+                self.dismiss_hover(cx);
+            }
+        }
         if primary && !modifiers.alt {
             match keystroke.key.as_str() {
                 "s" => {
@@ -658,6 +734,7 @@ impl WgpuiEditorView {
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss_hover(cx);
         let (mut dx, mut dy, precise) = match event.delta {
             // Whole-number line deltas are mouse-wheel notches: scroll a few
             // lines and glide. Fractional ones come from precision
@@ -754,6 +831,8 @@ impl WgpuiEditorView {
     ) {
         window.focus(&self.focus_handle, cx);
         let region = self.region_at(x, y);
+        self.dismiss_hover(cx);
+        self.close_completion(cx);
         match region {
             Region::VScroll => {
                 if let Some(thumb) = self.vertical_thumb() {
@@ -868,6 +947,7 @@ impl WgpuiEditorView {
                     self.hover = region;
                     cx.notify();
                 }
+                self.update_hover(x, y, region, cx);
             }
             Drag::Text => {
                 // Auto-scroll while the pointer is beyond the viewport.
@@ -1068,7 +1148,8 @@ struct PaintData {
 }
 
 impl Render for WgpuiEditorView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let overlays = self.render_overlays(window, cx);
         div()
             .size_full()
             .relative()
@@ -1080,6 +1161,7 @@ impl Render for WgpuiEditorView {
             .child(EditorElement {
                 editor: cx.entity(),
             })
+            .children(overlays)
     }
 }
 
@@ -1165,6 +1247,8 @@ impl Element for EditorElement {
     ) {
         let focused = self.editor.read(cx).focus_handle.is_focused(window);
         let data = self.editor.read(cx).paint_data(focused);
+        self.editor
+            .update(cx, |view, _| view.intel.origin = bounds.origin);
         window.set_cursor_style(CursorStyle::IBeam, text_hitbox);
         paint_editor(&data, bounds, window, cx);
         register_mouse_listeners(self.editor.clone(), bounds, window);
@@ -1184,7 +1268,11 @@ fn register_mouse_listeners(editor: Entity<WgpuiEditorView>, bounds: Bounds<Pixe
         let y = (event.position.y - bounds.origin.y).to_f32();
         let click_count = event.click_count;
         let shift = event.modifiers.shift;
+        let definition = event.modifiers.control || event.modifiers.platform;
         down.update(cx, |view, cx| {
+            if definition && view.definition_click(x, y, cx) {
+                return;
+            }
             view.mouse_down(x, y, click_count, shift, window, cx);
         });
         cx.stop_propagation();

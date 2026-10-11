@@ -19,16 +19,22 @@ use mockaco_language::{
 };
 use mockaco_renderer::{
     diagnostic_decorations, search_decorations, Decoration, DisplayMap, DisplayMapError,
+    DIAGNOSTIC_ERROR_STYLE_ID, DIAGNOSTIC_HINT_STYLE_ID, DIAGNOSTIC_INFO_STYLE_ID,
+    DIAGNOSTIC_WARNING_STYLE_ID,
     DisplayPoint, DisplayViewport, GutterLayout, ProjectedDecoration,
 };
 use std::fmt;
 use std::ops::Range;
 
 pub mod chrome;
+pub mod intel;
+pub mod markdown;
 mod language_worker;
 use language_worker::{LanguageWorker, Outcome, Provider};
 #[cfg(feature = "native-wgpui")]
 pub mod native;
+#[cfg(feature = "native-wgpui")]
+mod popups;
 
 /// Language the surface highlights and folds. Rust uses the bundled
 /// Tree-sitter grammar; every other known language uses the lexical provider.
@@ -644,7 +650,37 @@ pub struct EditorSurface {
     theme: SurfaceTheme,
     decorations: Vec<Decoration>,
     invalidation: InvalidationState,
+    /// Edits since the host last called [`Self::take_pending_sync`].
+    text_changes: Vec<TextChange>,
+    /// Language-server diagnostics, kept in step with edits.
+    lsp_diagnostics: Vec<mockaco_core::Diagnostic>,
+    /// The document changed in a way not described by `text_changes`.
+    full_sync: bool,
 }
+
+/// One edit in the form language servers take: line and UTF-16 column
+/// positions in the document as it was just *before* this edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextChange {
+    pub start: mockaco_core::TextPosition,
+    pub end: mockaco_core::TextPosition,
+    pub text: String,
+}
+
+/// What the host must tell a language server to catch it up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingSync {
+    /// The server already has the current text.
+    None,
+    /// Apply these changes in order.
+    Incremental(Vec<TextChange>),
+    /// Send the whole document (it was replaced, or history changed).
+    Full,
+}
+
+/// More buffered edits than this collapse into a full resync: the host is not
+/// draining them, and a full text is cheaper than replaying a long log.
+const MAX_PENDING_CHANGES: usize = 512;
 
 impl EditorSurface {
     pub fn new(
@@ -679,6 +715,9 @@ impl EditorSurface {
             theme: SurfaceTheme::default(),
             decorations: Vec::new(),
             invalidation: InvalidationState::default(),
+            text_changes: Vec::new(),
+            lsp_diagnostics: Vec::new(),
+            full_sync: false,
         };
         surface.recompute_scroll_viewport();
         surface.ensure_language_state_for_viewport();
@@ -758,6 +797,7 @@ impl EditorSurface {
     /// flows while preserving the current display configuration.
     pub fn replace_text(&mut self, text: impl Into<mockaco_core::Text>) {
         self.editor = EditorState::new(text);
+        self.mark_full_sync();
         let snapshot = self.editor.snapshot();
         let config = self.display.config().clone();
         self.display = DisplayMap::new(&snapshot, config);
@@ -970,6 +1010,194 @@ impl EditorSurface {
     }
 
     /// Scrolls the least distance that brings `byte` fully into view.
+    /// Drains the edits a language server has not seen yet. Cheap when
+    /// nothing changed; never copies the document.
+    pub fn take_pending_sync(&mut self) -> PendingSync {
+        if std::mem::take(&mut self.full_sync) {
+            self.text_changes.clear();
+            return PendingSync::Full;
+        }
+        if self.text_changes.is_empty() {
+            PendingSync::None
+        } else {
+            PendingSync::Incremental(std::mem::take(&mut self.text_changes))
+        }
+    }
+
+    fn mark_full_sync(&mut self) {
+        self.full_sync = true;
+        self.text_changes.clear();
+        // The document was replaced wholesale; old ranges mean nothing now.
+        if !self.lsp_diagnostics.is_empty() {
+            self.lsp_diagnostics.clear();
+            self.decorations
+                .retain(|decoration| !is_diagnostic_style(decoration.style.id));
+            self.invalidation.push(InvalidationKind::Decoration, None);
+        }
+    }
+
+    /// Replaces the language-server diagnostics. Ranges are byte ranges in
+    /// the current document; invalid ones are skipped and empty ones widen to
+    /// one character so they stay visible. Later edits move the ranges along
+    /// with the text until the server publishes again.
+    pub fn set_lsp_diagnostics(&mut self, diagnostics: Vec<mockaco_core::Diagnostic>) {
+        let snapshot = self.editor.snapshot();
+        let text = snapshot.text();
+        let len = text.len();
+        let mut valid: Vec<mockaco_core::Diagnostic> = diagnostics
+            .into_iter()
+            .filter_map(|mut diagnostic| {
+                let range = diagnostic.range.clone();
+                if range.start > range.end
+                    || range.end > len
+                    || !text.is_char_boundary(range.start)
+                    || !text.is_char_boundary(range.end)
+                {
+                    return None;
+                }
+                if range.start == range.end {
+                    let widened = match text.chars_from(range.start).next() {
+                        Some((_, c)) if c != '\n' && c != '\r' => range.start + c.len_utf8(),
+                        _ => match text.chars_before(range.start).next() {
+                            Some((offset, c)) if c != '\n' && c != '\r' => {
+                                diagnostic.range = offset..range.start;
+                                return Some(diagnostic);
+                            }
+                            _ => return None,
+                        },
+                    };
+                    diagnostic.range = range.start..widened;
+                }
+                Some(diagnostic)
+            })
+            .collect();
+        valid.sort_by_key(|diagnostic| (diagnostic.range.start, diagnostic.range.end));
+        self.lsp_diagnostics = valid;
+        self.refresh_diagnostic_decorations();
+    }
+
+    pub fn lsp_diagnostics(&self) -> &[mockaco_core::Diagnostic] {
+        &self.lsp_diagnostics
+    }
+
+    /// Diagnostics whose range contains `byte`, most severe first.
+    pub fn diagnostics_at(&self, byte: usize) -> Vec<&mockaco_core::Diagnostic> {
+        let mut found: Vec<_> = self
+            .lsp_diagnostics
+            .iter()
+            .take_while(|diagnostic| diagnostic.range.start <= byte)
+            .filter(|diagnostic| byte < diagnostic.range.end)
+            .collect();
+        found.sort_by_key(|diagnostic| diagnostic.severity);
+        found
+    }
+
+    fn refresh_diagnostic_decorations(&mut self) {
+        let mut decorations: Vec<Decoration> = self
+            .decorations
+            .iter()
+            .filter(|decoration| !is_diagnostic_style(decoration.style.id))
+            .cloned()
+            .collect();
+        decorations.extend(self.lsp_diagnostics.iter().map(|diagnostic| {
+            let style = match diagnostic.severity {
+                mockaco_core::DiagnosticSeverity::Error => DIAGNOSTIC_ERROR_STYLE_ID,
+                mockaco_core::DiagnosticSeverity::Warning => DIAGNOSTIC_WARNING_STYLE_ID,
+                mockaco_core::DiagnosticSeverity::Info => DIAGNOSTIC_INFO_STYLE_ID,
+                mockaco_core::DiagnosticSeverity::Hint => DIAGNOSTIC_HINT_STYLE_ID,
+            };
+            Decoration::new(diagnostic.range.clone(), style)
+        }));
+        self.set_decorations(decorations);
+    }
+
+    /// Carries diagnostic ranges through an edit.
+    fn map_diagnostics(&mut self, changes: &mockaco_core::ChangeMap) {
+        self.lsp_diagnostics.retain_mut(|diagnostic| {
+            let start = changes.map_offset(diagnostic.range.start, Affinity::After);
+            let end = changes.map_offset(diagnostic.range.end, Affinity::Before);
+            if end > start {
+                diagnostic.range = start..end;
+                true
+            } else {
+                false
+            }
+        });
+        self.refresh_diagnostic_decorations();
+    }
+
+    /// Logs `applied` for incremental sync. A transaction's edits are sorted
+    /// and expressed against the text before it; they are reported last to
+    /// first so each position is still valid when its turn comes.
+    fn record_changes(
+        &mut self,
+        before: &DocumentSnapshot,
+        applied: &mockaco_core::AppliedTransaction,
+    ) {
+        if self.full_sync {
+            return;
+        }
+        let text = before.text();
+        let mut changes = Vec::with_capacity(applied.change_map.edits().len());
+        for edit in applied.change_map.edits().iter().rev() {
+            let (Ok(start), Ok(end)) = (
+                text.byte_to_utf16_position(edit.range.start),
+                text.byte_to_utf16_position(edit.range.end),
+            ) else {
+                self.mark_full_sync();
+                return;
+            };
+            changes.push(TextChange {
+                start,
+                end,
+                text: edit.replacement.clone(),
+            });
+        }
+        self.text_changes.extend(changes);
+        if self.text_changes.len() > MAX_PENDING_CHANGES {
+            self.mark_full_sync();
+        }
+    }
+
+    /// The byte of the character under the pointer, or `None` when the
+    /// pointer is not over text (past a line's end, below the document).
+    /// `x`/`y` are editor-local, with the sub-column and sub-row scroll
+    /// remainders already added, exactly as for clicks.
+    pub fn byte_under_pointer(&self, x: f32, y: f32) -> Option<usize> {
+        if !x.is_finite() || !y.is_finite() || y < 0.0 || self.geometry.line_height <= 0.0 {
+            return None;
+        }
+        let code_x = x - self.gutter_width() - CODE_PADDING;
+        if code_x < 0.0 {
+            return None;
+        }
+        let row = self
+            .scroll
+            .top_row
+            .saturating_add((y / self.geometry.line_height).floor() as usize);
+        let display_row = self.display.row(row)?;
+        let column = (code_x / self.geometry.character_width.max(1.0)).floor() as usize
+            + self.scroll.horizontal_columns;
+        if column >= display_row.display_width {
+            return None;
+        }
+        self.display
+            .display_to_buffer(DisplayPoint { row, column }, Affinity::Before)
+            .map(|point| point.byte_offset)
+            .ok()
+    }
+
+    /// Pixel position of `byte`'s left edge and top, relative to the start of
+    /// the text area and the first visible row (add the chrome offsets and
+    /// subtract the scroll remainders to get editor-local pixels).
+    pub fn byte_to_text_pixel(&self, byte: usize) -> Option<(f32, f32)> {
+        let point = self.display.buffer_to_display(byte, Affinity::After).ok()?;
+        let x = (point.column as f32 - self.scroll.horizontal_columns as f32)
+            * self.geometry.character_width;
+        let y = (point.row as f32 - self.scroll.top_row as f32) * self.geometry.line_height;
+        Some((x, y))
+    }
+
     pub fn reveal_byte(&mut self, byte: usize) -> bool {
         let Ok(point) = self.display.buffer_to_display(byte, Affinity::After)
         else {
@@ -1013,6 +1241,7 @@ impl EditorSurface {
     ) -> Result<mockaco_core::AppliedTransaction, SurfaceError> {
         let before_snapshot = self.editor.snapshot();
         let applied = self.editor.apply_with_result(transaction, grouping)?;
+        self.record_changes(&before_snapshot, &applied);
         let snapshot = self.editor.snapshot();
         // Updated in place: cloning a million-row display map per keystroke
         // costs more than the update itself. Should the update fail part-way,
@@ -1043,6 +1272,9 @@ impl EditorSurface {
         self.ensure_language_state_for_viewport();
         self.invalidation
             .push(InvalidationKind::Document, Some(update.new_range));
+        if !self.lsp_diagnostics.is_empty() {
+            self.map_diagnostics(&applied.change_map);
+        }
         Ok(applied)
     }
 
@@ -1050,6 +1282,7 @@ impl EditorSurface {
         let Some(applied) = self.editor.commit_composition_with_result()? else {
             return Ok(false);
         };
+        self.mark_full_sync();
         let snapshot = self.editor.snapshot();
         let mut display = self.display.clone();
         let update = display.update(&snapshot, &applied)?;
@@ -1304,6 +1537,7 @@ impl EditorSurface {
     }
 
     fn rebuild_display_after_history_change(&mut self) {
+        self.mark_full_sync();
         let snapshot = self.editor.snapshot();
         let config = self.display.config().clone();
         let folds = self.display.folds().clone();
@@ -1621,6 +1855,16 @@ fn paint_diff_row(result: &DiffResult, row: usize, side: DiffSide) -> DiffPaintR
         kind: diff_row.kind,
         hunk: diff_row.hunk,
     }
+}
+
+fn is_diagnostic_style(id: u32) -> bool {
+    matches!(
+        id,
+        DIAGNOSTIC_ERROR_STYLE_ID
+            | DIAGNOSTIC_WARNING_STYLE_ID
+            | DIAGNOSTIC_INFO_STYLE_ID
+            | DIAGNOSTIC_HINT_STYLE_ID
+    )
 }
 
 fn merge_ranges(left: Option<Range<usize>>, right: Option<Range<usize>>) -> Option<Range<usize>> {
@@ -3287,5 +3531,124 @@ mod tests {
             Err(SurfaceError::Diff(DiffError::StaleResult { .. }))
         ));
         assert_eq!(surface.take_invalidations().invalidations.len(), 1);
+    }
+
+    #[test]
+    fn edits_are_logged_for_incremental_sync_last_to_first() {
+        let mut surface = surface("héllo\nworld");
+        assert_eq!(surface.take_pending_sync(), PendingSync::None);
+        let transaction = Transaction::new()
+            .replace(0..1, "H")
+            .replace(7..10, "WORLD");
+        surface
+            .apply_transaction(&transaction, Grouping::Separate)
+            .unwrap();
+        let PendingSync::Incremental(changes) = surface.take_pending_sync() else {
+            panic!("incremental sync expected");
+        };
+        assert_eq!(changes.len(), 2);
+        // Last edit first: its position is untouched by the earlier one.
+        assert_eq!(changes[0].text, "WORLD");
+        assert_eq!(changes[0].start, mockaco_core::TextPosition { line: 1, column: 0 });
+        assert_eq!(changes[0].end, mockaco_core::TextPosition { line: 1, column: 3 });
+        assert_eq!(changes[1].text, "H");
+        assert_eq!(surface.take_pending_sync(), PendingSync::None);
+    }
+
+    #[test]
+    fn columns_are_utf16_not_bytes() {
+        let mut surface = surface("a😀b");
+        surface
+            .apply_transaction(&Transaction::new().insert(5, "X"), Grouping::Separate)
+            .unwrap();
+        let PendingSync::Incremental(changes) = surface.take_pending_sync() else {
+            panic!("incremental sync expected");
+        };
+        // "a" (1) + emoji (2 UTF-16 units) = column 3.
+        assert_eq!(changes[0].start.column, 3);
+    }
+
+    #[test]
+    fn history_and_replacement_force_a_full_sync() {
+        let mut surface = surface("abc");
+        surface
+            .apply_transaction(&Transaction::new().insert(3, "d"), Grouping::Separate)
+            .unwrap();
+        assert!(surface.undo());
+        assert_eq!(surface.take_pending_sync(), PendingSync::Full);
+        assert_eq!(surface.take_pending_sync(), PendingSync::None);
+        surface.replace_text("new");
+        assert_eq!(surface.take_pending_sync(), PendingSync::Full);
+    }
+
+    #[test]
+    fn an_undrained_log_collapses_into_a_full_sync() {
+        let mut surface = surface("");
+        for _ in 0..=MAX_PENDING_CHANGES {
+            surface
+                .apply_transaction(&Transaction::new().insert(0, "x"), Grouping::Separate)
+                .unwrap();
+        }
+        assert_eq!(surface.take_pending_sync(), PendingSync::Full);
+    }
+
+    #[test]
+    fn diagnostics_follow_edits_and_empty_ones_widen() {
+        use mockaco_core::{Diagnostic, DiagnosticSeverity};
+        let mut surface = surface("let x = 1;");
+        surface.set_lsp_diagnostics(vec![
+            Diagnostic::new(4..5, DiagnosticSeverity::Warning, "unused"),
+            Diagnostic::new(9..9, DiagnosticSeverity::Error, "empty"),
+            Diagnostic::new(40..50, DiagnosticSeverity::Error, "out of range"),
+        ]);
+        assert_eq!(surface.lsp_diagnostics().len(), 2);
+        assert_eq!(surface.lsp_diagnostics()[1].range, 9..10);
+        assert_eq!(surface.diagnostics_at(4).len(), 1);
+        assert!(surface.diagnostics_at(6).is_empty());
+
+        surface
+            .apply_transaction(&Transaction::new().insert(0, "// hi\n"), Grouping::Separate)
+            .unwrap();
+        assert_eq!(surface.lsp_diagnostics()[0].range, 10..11);
+        assert_eq!(surface.diagnostics_at(10)[0].message, "unused");
+
+        // Deleting the flagged text drops its diagnostic.
+        surface
+            .apply_transaction(&Transaction::new().delete(10..11), Grouping::Separate)
+            .unwrap();
+        assert_eq!(surface.lsp_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn diagnostics_are_painted_as_decorations() {
+        use mockaco_core::{Diagnostic, DiagnosticSeverity};
+        let mut surface = surface("let x = 1;");
+        surface.set_lsp_diagnostics(vec![Diagnostic::new(
+            4..5,
+            DiagnosticSeverity::Error,
+            "bad",
+        )]);
+        let frame = surface.render_frame();
+        assert_eq!(frame.decoration_geometry.len(), 1);
+        assert_eq!(frame.decoration_geometry[0].style.id, DIAGNOSTIC_ERROR_STYLE_ID);
+        surface.replace_text("other");
+        assert!(surface.render_frame().decoration_geometry.is_empty());
+    }
+
+    #[test]
+    fn pointer_resolves_to_the_character_underneath() {
+        let surface = surface("fn main() {}\n\nlet");
+        // Default geometry: 8px columns, 20px rows; the gutter and padding
+        // push the text start right.
+        let origin = surface.gutter_width() + CODE_PADDING;
+        let on_m = surface.byte_under_pointer(origin + 3.0 * 8.0 + 1.0, 5.0);
+        assert_eq!(on_m, Some(3));
+        // Past the end of the line, on a blank line, in the gutter.
+        assert_eq!(surface.byte_under_pointer(origin + 40.0 * 8.0, 5.0), None);
+        assert_eq!(surface.byte_under_pointer(origin + 1.0, 25.0), None);
+        assert_eq!(surface.byte_under_pointer(2.0, 5.0), None);
+        // Round-trips with the pixel position of a byte.
+        let (x, y) = surface.byte_to_text_pixel(3).unwrap();
+        assert_eq!((x, y), (24.0, 0.0));
     }
 }
