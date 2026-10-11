@@ -535,9 +535,12 @@ impl WgpuiEditorView {
         }
     }
 
+    /// Characters after which completion is offered without an identifier
+    /// being started: member access, paths, and the separators and openers
+    /// after which a new expression or argument begins.
     fn is_trigger(&self, c: char, caret: usize) -> bool {
         match c {
-            '.' => true,
+            '.' | ',' | ' ' | '(' | '[' | '{' | '=' | '<' | '&' | '!' => true,
             ':' => caret >= 2 && self.surface.document().text().char_at(caret - 2) == Some(':'),
             _ => false,
         }

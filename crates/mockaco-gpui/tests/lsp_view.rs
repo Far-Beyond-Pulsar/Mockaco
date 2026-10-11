@@ -102,3 +102,46 @@ fn a_host_answer_opens_the_completion_menu() {
     cx.run_until_parked();
     assert_eq!(view.read_with(cx, |view, _| view.completion_len()), 2);
 }
+
+fn requested_after_typing(typed: &[&str], start: &'static str) -> Option<Option<char>> {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = view_with(&mut cx, start);
+    let mut events = cx.events::<EditorEvent, _>(&view);
+    for piece in typed {
+        cx.simulate_input(piece);
+    }
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+    let mut last = None;
+    while let Ok(event) = events.try_recv() {
+        if let EditorEvent::CompletionRequested { trigger, .. } = event {
+            last = Some(trigger);
+        }
+    }
+    last
+}
+
+#[test]
+fn trigger_characters_request_completion() {
+    // (typed pieces, start text, expected trigger of the last request)
+    let cases: &[(&[&str], &str, Option<char>)] = &[
+        (&["."], "value", Some('.')),
+        (&[":", ":"], "Vec", Some(':')),
+        (&[","], "foo(a", Some(',')),
+        (&[" "], "let x =", Some(' ')),
+        (&["("], "foo", Some('(')),
+        (&["["], "let a = x", Some('[')),
+    ];
+    for (typed, start, expected) in cases {
+        assert_eq!(
+            requested_after_typing(typed, start),
+            Some(*expected),
+            "typing {typed:?} after {start:?} should request completion triggered by {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn a_single_colon_is_not_a_trigger() {
+    assert_eq!(requested_after_typing(&[":"], "let x"), None);
+}
