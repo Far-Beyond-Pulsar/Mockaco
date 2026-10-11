@@ -19,10 +19,11 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use wgpui::prelude::FluentBuilder as _;
 use wgpui::{
-    div, font, list, px, uniform_list, AnyElement, App, ElementId, FontFallbacks, FontStyle,
-    FontWeight, Hsla, InteractiveElement, InteractiveText, IntoElement, ListAlignment, ListState,
-    ParentElement, Pixels, Rgba, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
-    StyledText, TextRun, UnderlineStyle, UniformListScrollHandle, Window,
+    canvas, div, fill, font, list, px, uniform_list, AnyElement, App, Bounds, Corners, ElementId,
+    FontFallbacks, FontStyle, FontWeight, Hsla, InteractiveElement, InteractiveText, IntoElement,
+    ListAlignment, ListState, ParentElement, Pixels, Rgba, ScrollHandle, ScrollStrategy,
+    SharedString, StatefulInteractiveElement, Styled, StyledText, TextRun, UnderlineStyle,
+    UniformListScrollHandle, Window,
 };
 
 /// Width of the hover card and the documentation panel.
@@ -354,6 +355,8 @@ pub(crate) struct HoverCard {
     pub diagnostics: Vec<DiagnosticLine>,
     pub blocks: Rc<Vec<BlockView>>,
     pub list: ListState,
+    /// Scroll position of the short-page layout (long pages use `list`).
+    pub scroll: ScrollHandle,
 }
 
 impl HoverCard {
@@ -361,6 +364,7 @@ impl HoverCard {
         Self {
             diagnostics,
             list: ListState::new(blocks.len(), ListAlignment::Top, px(800.0)),
+            scroll: ScrollHandle::new(),
             blocks: Rc::new(blocks),
         }
     }
@@ -537,6 +541,66 @@ fn render_block(
     }
 }
 
+/// Where a scrollbar reads its position from.
+#[derive(Clone)]
+enum ScrollSource {
+    Handle(ScrollHandle),
+    List(ListState),
+}
+
+/// `(offset, max_offset, viewport_height)` in pixels, offset >= 0.
+fn scroll_metrics(source: &ScrollSource) -> (f32, f32, f32) {
+    match source {
+        ScrollSource::Handle(handle) => (
+            (-handle.offset().y.to_f32()).max(0.0),
+            handle.max_offset().height.to_f32(),
+            handle.bounds().size.height.to_f32(),
+        ),
+        ScrollSource::List(state) => (
+            (-state.scroll_px_offset_for_scrollbar().y.to_f32()).max(0.0),
+            state.max_offset_for_scrollbar().height.to_f32(),
+            state.viewport_bounds().size.height.to_f32(),
+        ),
+    }
+}
+
+/// Thumb `(top, height)` inside a track of `track` pixels, or `None` when
+/// there is nothing to scroll.
+fn thumb_geometry(offset: f32, max_offset: f32, viewport: f32, track: f32) -> Option<(f32, f32)> {
+    if max_offset < 1.0 || viewport <= 0.0 || track <= 0.0 {
+        return None;
+    }
+    let height = (track * viewport / (viewport + max_offset)).clamp(24.0_f32.min(track), track);
+    let top = (offset / max_offset).clamp(0.0, 1.0) * (track - height);
+    Some((top, height))
+}
+
+/// A slim scrollbar thumb along the right edge of its (relative) parent,
+/// painted from the scroll state of the current frame; invisible when the
+/// content fits.
+fn scrollbar(source: ScrollSource, color: Hsla) -> AnyElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds: Bounds<Pixels>, _, window, _| {
+            let (offset, max, viewport) = scroll_metrics(&source);
+            let track = bounds.size.height.to_f32();
+            if let Some((top, height)) = thumb_geometry(offset, max, viewport, track) {
+                let thumb = Bounds {
+                    origin: bounds.origin + wgpui::point(px(0.0), px(top)),
+                    size: wgpui::size(bounds.size.width, px(height)),
+                };
+                window.paint_quad(fill(thumb, color).corner_radii(Corners::all(px(3.0))));
+            }
+        },
+    )
+    .absolute()
+    .top(px(2.0))
+    .bottom(px(2.0))
+    .right(px(2.0))
+    .w(px(6.0))
+    .into_any_element()
+}
+
 /// Pages with more blocks than this are virtualized; shorter ones are laid out
 /// directly.
 const VIRTUALIZE_ABOVE_BLOCKS: usize = 48;
@@ -556,30 +620,43 @@ fn blocks_list(
     max_height: f32,
     window: &Window,
 ) -> AnyElement {
+    let thumb = Hsla {
+        a: 0.55,
+        ..colors.muted
+    };
     if card.blocks.len() <= VIRTUALIZE_ABOVE_BLOCKS {
+        let content =
+            div()
+                .id("mockaco-doc-scroll")
+                .w_full()
+                .max_h(px(max_height))
+                .overflow_y_scroll()
+                .track_scroll(&card.scroll)
+                .children(card.blocks.iter().enumerate().map(|(index, block)| {
+                    render_block(block, index, &colors, &mono, size, window)
+                }));
         return div()
-            .id("mockaco-doc-scroll")
+            .relative()
             .w_full()
-            .max_h(px(max_height))
-            .overflow_y_scroll()
-            .children(
-                card.blocks
-                    .iter()
-                    .enumerate()
-                    .map(|(index, block)| render_block(block, index, &colors, &mono, size, window)),
-            )
+            .child(content)
+            .child(scrollbar(ScrollSource::Handle(card.scroll.clone()), thumb))
             .into_any_element();
     }
     let blocks = card.blocks.clone();
-    list(card.list.clone(), move |index, window, _cx| {
+    let content = list(card.list.clone(), move |index, window, _cx| {
         match blocks.get(index) {
             Some(block) => render_block(block, index, &colors, &mono, size, window),
             None => div().into_any_element(),
         }
     })
     .w_full()
-    .h(px(max_height))
-    .into_any_element()
+    .h(px(max_height));
+    div()
+        .relative()
+        .w_full()
+        .child(content)
+        .child(scrollbar(ScrollSource::List(card.list.clone()), thumb))
+        .into_any_element()
 }
 
 fn card_shell(colors: &PopupColors, width: f32) -> wgpui::Div {
@@ -951,5 +1028,37 @@ mod tests {
             card_placement(500.0, 520.0, 900.0),
             card_placement(500.0, 520.0, 900.0)
         );
+    }
+}
+
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::*;
+
+    #[test]
+    fn nothing_to_scroll_means_no_thumb() {
+        assert_eq!(thumb_geometry(0.0, 0.0, 300.0, 296.0), None);
+        assert_eq!(thumb_geometry(0.0, 0.5, 300.0, 296.0), None);
+    }
+
+    #[test]
+    fn the_thumb_is_proportional_and_tracks_the_offset() {
+        // Viewport 300 over 600 of content: half the track.
+        let (top, height) = thumb_geometry(0.0, 300.0, 300.0, 296.0).unwrap();
+        assert_eq!((top, height), (0.0, 148.0));
+        let (top, height) = thumb_geometry(300.0, 300.0, 300.0, 296.0).unwrap();
+        assert_eq!(
+            top + height,
+            296.0,
+            "at the end the thumb touches the bottom"
+        );
+        let (mid, _) = thumb_geometry(150.0, 300.0, 300.0, 296.0).unwrap();
+        assert_eq!(mid, 74.0);
+    }
+
+    #[test]
+    fn a_huge_page_keeps_a_grabbable_thumb() {
+        let (_, height) = thumb_geometry(0.0, 1_000_000.0, 300.0, 296.0).unwrap();
+        assert_eq!(height, 24.0);
     }
 }

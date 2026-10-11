@@ -36,3 +36,69 @@ fn pointer_rest_requests_hover() {
         "no hover request; events: {seen:?}"
     );
 }
+
+fn view_with<'a>(cx: &'a mut TestAppContext, text: &'static str) -> (wgpui::Entity<WgpuiEditorView>, &'a mut wgpui::VisualTestContext) {
+    let (view, cx) = cx.add_window_view(move |_window, cx| {
+        let surface = EditorSurface::with_language(
+            text,
+            Default::default(),
+            SurfaceGeometry::default(),
+            Language::Rust,
+        );
+        let mut view = WgpuiEditorView::new(surface, cx);
+        view.set_language_intelligence(true, cx);
+        view
+    });
+    cx.update(|window, app| {
+        let handle = wgpui::Focusable::focus_handle(view.read(app), app);
+        window.focus(&handle, app);
+    });
+    cx.run_until_parked();
+    (view, cx)
+}
+
+#[test]
+fn typing_an_identifier_requests_completion() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = view_with(&mut cx, "");
+    let mut events = cx.events::<EditorEvent, _>(&view);
+    cx.simulate_input("v");
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+    let mut seen = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        seen.push(event);
+    }
+    assert!(
+        seen.iter().any(|e| matches!(e, EditorEvent::CompletionRequested { .. })),
+        "typing produced no completion request; events: {seen:?}"
+    );
+}
+
+#[test]
+fn a_host_answer_opens_the_completion_menu() {
+    use mockaco_gpui::intel::CompletionEntry;
+    let mut cx = TestAppContext::single();
+    let (view, cx) = view_with(&mut cx, "");
+    let mut events = cx.events::<EditorEvent, _>(&view);
+    cx.simulate_input("v");
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+    let request = loop {
+        match events.try_recv() {
+            Ok(EditorEvent::CompletionRequested { request, .. }) => break request,
+            Ok(_) => continue,
+            Err(_) => panic!("no completion request"),
+        }
+    };
+    view.update(cx, |view, cx| {
+        view.show_completions(
+            request.id,
+            request.version,
+            vec![CompletionEntry::new("value"), CompletionEntry::new("vec")],
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |view, _| view.completion_len()), 2);
+}
