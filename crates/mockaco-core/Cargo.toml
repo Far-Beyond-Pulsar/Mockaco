@@ -8,3 +8,9 @@ description = "Framework-independent editing primitives for Mockaco"
 [lib]
 path = "src/lib.rs"
 
+
+[dependencies]
+# A B-tree rope: O(log n) edits and line lookups, O(1) snapshot clones.
+# Only LF is a line break, matching Mockaco's line model (CR before LF is part
+# of the line ending, a lone CR is ordinary text).
+ropey = { version = "1.6", default-features = false, features = ["simd"] }

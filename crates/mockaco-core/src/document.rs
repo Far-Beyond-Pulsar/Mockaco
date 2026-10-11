@@ -1,15 +1,17 @@
-use crate::{AppliedTransaction, PositionMap, Transaction, TransactionError};
+use crate::{AppliedTransaction, PositionMap, Text, Transaction, TransactionError};
 use std::fmt;
 use std::sync::Arc;
 
 #[derive(Clone)]
 struct DocumentData {
-    text: Arc<str>,
+    text: Text,
     version: u64,
-    position_map: Arc<PositionMap>,
 }
 
-/// A mutable document whose snapshots share their text and coordinate map.
+/// A mutable document whose snapshots share their text.
+///
+/// The text is a rope, so applying an edit and taking a snapshot are both
+/// O(log n): versions share every chunk the edit did not touch.
 #[derive(Clone)]
 pub struct Document {
     data: Arc<DocumentData>,
@@ -41,19 +43,16 @@ impl Document {
         Self::new("")
     }
 
-    pub fn new(text: impl Into<String>) -> Self {
-        let text: Arc<str> = Arc::from(text.into());
-        let position_map = Arc::new(PositionMap::new(&text));
+    pub fn new(text: impl Into<Text>) -> Self {
         Self {
             data: Arc::new(DocumentData {
-                text,
+                text: text.into(),
                 version: 0,
-                position_map,
             }),
         }
     }
 
-    pub fn text(&self) -> &str {
+    pub fn text(&self) -> &Text {
         &self.data.text
     }
 
@@ -77,19 +76,15 @@ impl Document {
         }
     }
 
-    pub(crate) fn snapshot_with_version(text: String, version: u64) -> DocumentSnapshot {
-        let text: Arc<str> = Arc::from(text);
+    pub(crate) fn snapshot_with_version(text: Text, version: u64) -> DocumentSnapshot {
         DocumentSnapshot {
-            data: Arc::new(DocumentData {
-                position_map: Arc::new(PositionMap::new(&text)),
-                text,
-                version,
-            }),
+            data: Arc::new(DocumentData { text, version }),
         }
     }
 
+    /// Line and position conversions; the text itself.
     pub fn position_map(&self) -> &PositionMap {
-        &self.data.position_map
+        &self.data.text
     }
 
     pub fn apply(
@@ -97,25 +92,16 @@ impl Document {
         transaction: &Transaction,
     ) -> Result<AppliedTransaction, TransactionError> {
         let applied = transaction.apply(self.text(), self.version())?;
-        let version = applied.after_version;
-        let text: Arc<str> = Arc::from(applied.text.clone());
         self.data = Arc::new(DocumentData {
-            position_map: Arc::new(PositionMap::new(&text)),
-            text,
-            version,
+            text: applied.text.clone(),
+            version: applied.after_version,
         });
-        Ok(AppliedTransaction {
-            before_version: applied.before_version,
-            after_version: version,
-            text: applied.text,
-            change_map: applied.change_map,
-            inverse: applied.inverse,
-        })
+        Ok(applied)
     }
 }
 
 impl DocumentSnapshot {
-    pub fn text(&self) -> &str {
+    pub fn text(&self) -> &Text {
         &self.data.text
     }
 
@@ -128,7 +114,7 @@ impl DocumentSnapshot {
     }
 
     pub fn position_map(&self) -> &PositionMap {
-        &self.data.position_map
+        &self.data.text
     }
 }
 
@@ -136,7 +122,7 @@ impl fmt::Debug for Document {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Document")
             .field("version", &self.version())
-            .field("text", &self.text())
+            .field("len_bytes", &self.len_bytes())
             .finish()
     }
 }
@@ -145,7 +131,7 @@ impl fmt::Debug for DocumentSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DocumentSnapshot")
             .field("version", &self.version())
-            .field("text", &self.text())
+            .field("len_bytes", &self.len_bytes())
             .finish()
     }
 }

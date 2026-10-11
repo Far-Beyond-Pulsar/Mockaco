@@ -45,7 +45,7 @@ impl DemoState {
         &self.session
     }
 
-    pub fn text(&self) -> &str {
+    pub fn text(&self) -> &mockaco_core::Text {
         self.session.text()
     }
 
@@ -77,6 +77,7 @@ impl DemoState {
                 let range = self
                     .session
                     .text()
+                    .to_string()
                     .find("answer")
                     .map(|start| start..start + "answer".len());
                 if let Some(range) = range {
@@ -194,7 +195,7 @@ mod tests {
         demo.apply(DemoAction::LocalEdit);
         let edited = demo.text().to_owned();
         demo.apply(DemoAction::SaveFailure);
-        assert_eq!(demo.text(), edited);
+        assert_eq!(*demo.text(), edited);
         assert!(demo.session().is_dirty());
         demo.apply(DemoAction::SaveSuccess);
         assert!(!demo.session().is_dirty());

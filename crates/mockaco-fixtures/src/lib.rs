@@ -125,7 +125,7 @@ pub fn run_standalone() -> StandaloneReport {
     // Keep the metadata path exercised by the standalone API itself.
     assert_eq!(
         session.metadata().encoding,
-        DocumentMetadata::detect_utf8(session.text()).encoding
+        DocumentMetadata::detect_utf8(&session.text().to_string()).encoding
     );
 
     StandaloneReport {

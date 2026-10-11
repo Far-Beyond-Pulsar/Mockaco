@@ -486,7 +486,7 @@ pub struct DiffEditor {
 }
 
 impl DiffEditor {
-    pub fn new(original: &DocumentSnapshot, modified_text: impl Into<String>) -> Self {
+    pub fn new(original: &DocumentSnapshot, modified_text: impl Into<mockaco_core::Text>) -> Self {
         let modified = EditorState::new(modified_text);
         let diff = compute_diff(original, &modified.snapshot());
         Self {
@@ -557,8 +557,8 @@ impl DiffEditor {
 pub fn compute_diff(original: &DocumentSnapshot, modified: &DocumentSnapshot) -> DiffResult {
     let original_lines = source_lines(original);
     let modified_lines = source_lines(modified);
-    let original_values: Vec<_> = original_lines.iter().map(|line| line.text).collect();
-    let modified_values: Vec<_> = modified_lines.iter().map(|line| line.text).collect();
+    let original_values: Vec<&str> = original_lines.iter().map(|line| line.text.as_ref()).collect();
+    let modified_values: Vec<&str> = modified_lines.iter().map(|line| line.text.as_ref()).collect();
     let text_diff = TextDiff::from_slices(&original_values, &modified_values);
     let mut rows = Vec::new();
     let mut hunks = Vec::new();
@@ -641,7 +641,7 @@ pub fn compute_diff(original: &DocumentSnapshot, modified: &DocumentSnapshot) ->
 struct SourceLine<'a> {
     line: usize,
     byte_range: Range<usize>,
-    text: &'a str,
+    text: std::borrow::Cow<'a, str>,
 }
 
 fn source_lines(snapshot: &DocumentSnapshot) -> Vec<SourceLine<'_>> {
@@ -652,7 +652,7 @@ fn source_lines(snapshot: &DocumentSnapshot) -> Vec<SourceLine<'_>> {
             Some(SourceLine {
                 line,
                 byte_range: start..end,
-                text: &snapshot.text()[start..end],
+                text: snapshot.text().slice(start..end),
             })
         })
         .filter(|line| !(snapshot.text().is_empty() && line.line == 0))
@@ -663,7 +663,7 @@ fn to_diff_line(line: &SourceLine<'_>) -> DiffLine {
     DiffLine {
         line: line.line,
         byte_range: line.byte_range.clone(),
-        text: line.text.to_owned(),
+        text: line.text.to_string(),
     }
 }
 

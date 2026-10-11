@@ -250,7 +250,11 @@ impl SearchSession {
     }
 }
 
-fn find_matches(text: &str, query: &SearchQuery) -> Vec<Range<usize>> {
+/// A search is a scan of the whole document by nature, so it reads the text
+/// as one string; it runs when the query or the document changes, never per
+/// frame.
+fn find_matches(text: &crate::Text, query: &SearchQuery) -> Vec<Range<usize>> {
+    let text = &text.to_string();
     if query.pattern.is_empty() {
         return Vec::new();
     }

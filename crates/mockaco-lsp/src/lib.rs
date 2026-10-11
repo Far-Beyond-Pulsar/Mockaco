@@ -557,7 +557,6 @@ pub fn lsp_position_to_byte(
     snapshot
         .position_map()
         .utf16_position_to_byte(
-            snapshot.text(),
             TextPosition {
                 line: usize::try_from(position.line)
                     .map_err(|_| IntegrationError::ArithmeticOverflow)?,
@@ -810,14 +809,14 @@ impl WorkspaceDocuments {
 }
 
 impl EditableDocument {
-    pub fn new(text: impl Into<String>, version: DocumentVersion) -> Self {
+    pub fn new(text: impl Into<mockaco_core::Text>, version: DocumentVersion) -> Self {
         Self {
             state: EditorState::new(text),
             version,
         }
     }
 
-    pub fn text(&self) -> &str {
+    pub fn text(&self) -> &mockaco_core::Text {
         self.state.document().text()
     }
 

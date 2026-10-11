@@ -51,7 +51,7 @@ pub struct EditorState {
 }
 
 impl EditorState {
-    pub fn new(text: impl Into<String>) -> Self {
+    pub fn new(text: impl Into<crate::Text>) -> Self {
         let document = Document::new(text);
         Self {
             selections: SelectionSet::caret(0),

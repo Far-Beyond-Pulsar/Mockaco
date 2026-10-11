@@ -13,9 +13,9 @@ use mockaco_diff::{
     DiffSide,
 };
 use mockaco_language::{
-    FoldRange, FoldingProvider, FontStyle, GenericSyntaxProvider, HighlightResult,
-    IncrementalHighlights, LanguageError, LanguageSyntax, Rgba, RustTreeSitterProvider,
-    SyntaxHighlightProvider, Theme, TokenKind, TokenStyle,
+    FontStyle, GenericSyntaxProvider,
+    IncrementalHighlights, LanguageSyntax, Rgba, RustTreeSitterProvider,
+    Theme, TokenKind, TokenStyle,
 };
 use mockaco_renderer::{
     diagnostic_decorations, search_decorations, Decoration, DisplayMap, DisplayMapError,
@@ -25,6 +25,8 @@ use std::fmt;
 use std::ops::Range;
 
 pub mod chrome;
+mod language_worker;
+use language_worker::{LanguageWorker, Outcome, Provider};
 #[cfg(feature = "native-wgpui")]
 pub mod native;
 
@@ -80,47 +82,19 @@ impl PartialEq for Language {
 
 impl Eq for Language {}
 
-#[derive(Debug)]
-enum Highlighter {
-    Plain,
-    Rust(RustTreeSitterProvider),
-    Generic(GenericSyntaxProvider),
-}
-
-impl Highlighter {
-    fn new(language: Language) -> Self {
-        match language {
-            Language::Plain => Self::Plain,
-            Language::Rust => {
-                Self::Rust(RustTreeSitterProvider::new().expect("Rust Tree-sitter provider loads"))
-            }
-            Language::Syntax(syntax) => Self::Generic(GenericSyntaxProvider::new(syntax)),
+/// The worker that highlights and folds this surface's language, or `None`
+/// for plain text.
+fn language_worker(language: Language) -> Option<LanguageWorker> {
+    let provider = match language {
+        Language::Plain => return None,
+        Language::Rust => Provider::Rust(std::sync::Arc::new(
+            RustTreeSitterProvider::new().expect("Rust Tree-sitter provider loads"),
+        )),
+        Language::Syntax(syntax) => {
+            Provider::Generic(std::sync::Arc::new(GenericSyntaxProvider::new(syntax)))
         }
-    }
-
-    fn highlight(
-        &self,
-        snapshot: &DocumentSnapshot,
-        range: Range<usize>,
-    ) -> Result<HighlightResult, LanguageError> {
-        match self {
-            Self::Plain => Err(LanguageError::Provider("plain text".into())),
-            Self::Rust(provider) => provider.highlight(snapshot, range),
-            Self::Generic(provider) => provider.highlight(snapshot, range),
-        }
-    }
-
-    fn fold_ranges(
-        &self,
-        snapshot: &DocumentSnapshot,
-        range: Range<usize>,
-    ) -> Result<Vec<FoldRange>, LanguageError> {
-        match self {
-            Self::Plain => Ok(Vec::new()),
-            Self::Rust(provider) => provider.fold_ranges(snapshot, range),
-            Self::Generic(provider) => provider.fold_ranges(snapshot, range),
-        }
-    }
+    };
+    Some(LanguageWorker::spawn(provider))
 }
 
 /// Minimum digits reserved for line numbers.
@@ -655,7 +629,9 @@ impl InputOutcome {
 pub struct EditorSurface {
     editor: EditorState,
     display: DisplayMap,
-    highlighter: Highlighter,
+    language_worker: Option<LanguageWorker>,
+    /// The analysis last sent to the worker: `(document version, bytes)`.
+    language_requested: Option<(u64, Range<usize>)>,
     language: Language,
     highlights: IncrementalHighlights,
     language_coverage: Option<(u64, Range<usize>)>,
@@ -668,7 +644,7 @@ pub struct EditorSurface {
 
 impl EditorSurface {
     pub fn new(
-        text: impl Into<String>,
+        text: impl Into<mockaco_core::Text>,
         display_config: mockaco_renderer::DisplayConfig,
         geometry: SurfaceGeometry,
     ) -> Self {
@@ -676,20 +652,21 @@ impl EditorSurface {
     }
 
     pub fn with_language(
-        text: impl Into<String>,
+        text: impl Into<mockaco_core::Text>,
         display_config: mockaco_renderer::DisplayConfig,
         geometry: SurfaceGeometry,
         language: Language,
     ) -> Self {
         let editor = EditorState::new(text);
         let snapshot = editor.snapshot();
-        let highlighter = Highlighter::new(language);
+        let language_worker = language_worker(language);
         let highlights = IncrementalHighlights::new();
         let display = DisplayMap::new(&snapshot, display_config);
         let mut surface = Self {
             editor,
             display,
-            highlighter,
+            language_worker,
+            language_requested: None,
             language,
             highlights,
             language_coverage: None,
@@ -715,7 +692,7 @@ impl EditorSurface {
             return;
         }
         self.language = language;
-        self.highlighter = Highlighter::new(language);
+        self.language_worker = language_worker(language);
         let snapshot = self.editor.snapshot();
         self.refresh_language_state(&snapshot);
         self.invalidation.push(InvalidationKind::Document, None);
@@ -775,7 +752,7 @@ impl EditorSurface {
 
     /// Replaces the surface document for host-driven load/external-change
     /// flows while preserving the current display configuration.
-    pub fn replace_text(&mut self, text: impl Into<String>) {
+    pub fn replace_text(&mut self, text: impl Into<mockaco_core::Text>) {
         self.editor = EditorState::new(text);
         let snapshot = self.editor.snapshot();
         let config = self.display.config().clone();
@@ -867,19 +844,16 @@ impl EditorSurface {
             return false;
         }
         let is_word = |character: char| character.is_alphanumeric() || character == '_';
-        let start = text[..byte]
-            .char_indices()
-            .rev()
+        let start = text
+            .chars_before(byte)
             .take_while(|(_, character)| is_word(*character))
             .last()
             .map_or(byte, |(offset, _)| offset);
-        let end = text[byte..]
-            .char_indices()
+        let end = text
+            .chars_from(byte)
             .take_while(|(_, character)| is_word(*character))
             .last()
-            .map_or(byte, |(offset, character)| {
-                byte + offset + character.len_utf8()
-            });
+            .map_or(byte, |(offset, character)| offset + character.len_utf8());
         let range = if start == end { byte..byte } else { start..end };
         self.editor
             .set_selections(SelectionSet::new([Selection::range(
@@ -913,7 +887,7 @@ impl EditorSurface {
         let selected = selections
             .iter()
             .filter(|selection| !selection.is_caret())
-            .map(|selection| text[selection.ordered_range()].to_owned())
+            .map(|selection| text.slice(selection.ordered_range()).into_owned())
             .collect::<Vec<_>>();
         if !selected.is_empty() {
             return selected.join("\n");
@@ -934,7 +908,7 @@ impl EditorSurface {
                     .line_start(line)
                     .ok()?;
                 let end = self.editor.document().position_map().line_end(line).ok()?;
-                Some(text[start..end].to_owned())
+                Some(text.slice(start..end).into_owned())
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -1033,29 +1007,30 @@ impl EditorSurface {
         let before_snapshot = self.editor.snapshot();
         let applied = self.editor.apply_with_result(transaction, grouping)?;
         let snapshot = self.editor.snapshot();
-        let mut display = self.display.clone();
-        let update = display.update(&snapshot, &applied)?;
-        self.display = display;
+        // Updated in place: cloning a million-row display map per keystroke
+        // costs more than the update itself. Should the update fail part-way,
+        // the map is rebuilt from the new snapshot so it is never torn.
+        let update = match self.display.update(&snapshot, &applied) {
+            Ok(update) => update,
+            Err(error) => {
+                let config = self.display.config().clone();
+                let folds = self.display.folds().clone();
+                self.display = DisplayMap::with_folds(&snapshot, config, folds);
+                self.refresh_language_state(&snapshot);
+                self.recompute_scroll_viewport();
+                self.invalidation.push(InvalidationKind::Document, None);
+                return Err(error.into());
+            }
+        };
+        // Existing tokens are shifted through the edit and painted until the
+        // worker's fresh ones arrive, so typing never flashes uncolored text.
         let _ = self
             .highlights
             .apply_transaction(&before_snapshot, &applied);
         self.language_coverage = None;
-        match &self.highlighter {
-            Highlighter::Rust(provider) => {
-                if let Ok(result) = provider.apply_transaction(
-                    &before_snapshot,
-                    &snapshot,
-                    &applied,
-                    update.new_range.clone(),
-                ) {
-                    let _ = self.highlights.accept_range(result);
-                }
-            }
-            // Lexical results can change anywhere below an edit (an opened
-            // string or comment), so they are re-derived for the viewport.
-            Highlighter::Generic(_) | Highlighter::Plain => {
-                self.highlights = IncrementalHighlights::new();
-            }
+        self.language_requested = None;
+        if let Some(worker) = &mut self.language_worker {
+            worker.edit(before_snapshot, snapshot, applied.change_map.clone());
         }
         self.recompute_scroll_viewport();
         self.ensure_language_state_for_viewport();
@@ -1139,15 +1114,17 @@ impl EditorSurface {
             .selections()
             .primary()
             .and_then(|selection| position_map.byte_to_line(selection.cursor()).ok());
-        let rows = render_range
-            .clone()
-            .map(|display_row| {
-                let row = &self.display.rows()[display_row];
+        let rows = self
+            .display
+            .rows_in(render_range.clone())
+            .into_iter()
+            .zip(render_range.clone())
+            .map(|(row, display_row)| {
                 PaintRow {
                     display_row,
                     buffer_line: row.buffer_line,
                     source_range: row.start_byte..row.end_byte,
-                    text: text[row.start_byte..row.end_byte].to_owned(),
+                    text: text.slice(row.start_byte..row.end_byte).into_owned(),
                     y: display_y(display_row, self.scroll.top_row, self.geometry.line_height),
                     height: self.geometry.line_height,
                     continuation: row.continuation,
@@ -1332,64 +1309,128 @@ impl EditorSurface {
     fn refresh_language_state(&mut self, snapshot: &DocumentSnapshot) {
         self.highlights = IncrementalHighlights::new();
         self.language_coverage = None;
+        self.language_requested = None;
         self.display.set_foldable_regions([]);
         debug_assert_eq!(snapshot.version(), self.display.snapshot().version());
         self.ensure_language_state_for_viewport();
     }
 
+    /// Asks the worker for tokens and folds around the viewport when the
+    /// rows about to be painted are not covered yet. Never waits: the frame
+    /// paints what is known, and [`Self::poll_language`] applies the answer.
+    ///
+    /// The request reaches well past the viewport so smooth scrolling is
+    /// served before rows come into view, and it is re-sent once the viewport
+    /// gets within a screen of its edge rather than at the edge itself.
     fn ensure_language_state_for_viewport(&mut self) {
-        if matches!(self.highlighter, Highlighter::Plain) {
+        if self.language_worker.is_none() {
             return;
         }
         let document_version = self.display.snapshot().version();
-        let rows = self.display.rows();
-        if rows.is_empty() {
+        let display = &self.display;
+        let row_count = display.row_count();
+        if row_count == 0 {
             return;
         }
-        // Rows the frame will paint: the viewport plus the smooth-scroll
-        // buffer on both sides.
-        let top = self.scroll.top_row.min(rows.len() - 1);
-        let needed_start = top.saturating_sub(1);
-        let needed_end = top
-            .saturating_add(self.scroll.viewport_rows.saturating_add(2))
-            .min(rows.len());
-        let needed = rows[needed_start].start_byte..rows[needed_end - 1].end_byte;
-        if self
+        let viewport = self.scroll.viewport_rows.max(1);
+        let top = self.scroll.top_row.min(row_count - 1);
+        let byte_range = |start_row: usize, end_row: usize| {
+            let end_row = end_row.clamp(start_row + 1, row_count);
+            let start = display.row(start_row).map_or(0, |row| row.start_byte);
+            let end = display
+                .row(end_row - 1)
+                .map_or(start, |row| row.end_byte);
+            start..end
+        };
+        // The painted rows plus a screen of lookahead each way.
+        let wanted = byte_range(
+            top.saturating_sub(viewport),
+            top.saturating_add(viewport * 2 + 2),
+        );
+        let covers = |range: &Range<usize>| range.start <= wanted.start && range.end >= wanted.end;
+        let covered = self
             .language_coverage
             .as_ref()
-            .is_some_and(|(version, covered)| {
-                *version == document_version
-                    && covered.start <= needed.start
-                    && covered.end >= needed.end
-            })
-        {
+            .is_some_and(|(version, range)| *version == document_version && covers(range));
+        let requested = self
+            .language_requested
+            .as_ref()
+            .is_some_and(|(version, range)| *version == document_version && covers(range));
+        if covered || requested {
             return;
         }
+        let pad = (viewport * 3).max(160);
+        let range = byte_range(top.saturating_sub(pad), top + viewport + pad);
+        self.language_requested = Some((document_version, range.clone()));
+        let snapshot = self.display.snapshot().clone();
+        if let Some(worker) = &mut self.language_worker {
+            worker.analyze(snapshot, range);
+        }
+    }
 
-        // Highlight a generous window around the viewport so ordinary
-        // scrolling never leaves unhighlighted rows or fold markers behind.
-        let pad = self.scroll.viewport_rows.max(48);
-        let start_row = top.saturating_sub(pad);
-        let end_row = top
-            .saturating_add(self.scroll.viewport_rows)
-            .saturating_add(pad)
-            .min(rows.len());
-        let first = &rows[start_row];
-        let last = &rows[end_row - 1];
-        let requested = first.start_byte..last.end_byte;
-
-        if let Ok(result) = self
-            .highlighter
-            .highlight(self.display.snapshot(), requested.clone())
+    /// Applies everything the language worker has finished. Returns whether
+    /// highlights or folds changed (the host should repaint).
+    pub fn poll_language(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(outcome) = self
+            .language_worker
+            .as_mut()
+            .and_then(LanguageWorker::try_next)
         {
+            changed |= self.apply_language_outcome(outcome);
+        }
+        changed
+    }
+
+    /// Whether the language worker still has requests in flight. A host keeps
+    /// polling (one more frame) while this is true.
+    pub fn language_pending(&self) -> bool {
+        self.language_worker
+            .as_ref()
+            .is_some_and(LanguageWorker::is_busy)
+    }
+
+    /// Waits for the language worker to finish and applies its results, so
+    /// the next frame is fully highlighted. For tests and for hosts that need
+    /// a complete first paint (screenshots).
+    pub fn flush_language(&mut self) {
+        loop {
+            while let Some(outcome) = self
+                .language_worker
+                .as_mut()
+                .and_then(LanguageWorker::next_blocking)
+            {
+                self.apply_language_outcome(outcome);
+            }
+            // Applying a result may have asked for more (folds changed rows).
+            if !self.language_pending() {
+                break;
+            }
+        }
+    }
+
+    fn apply_language_outcome(&mut self, outcome: Outcome) -> bool {
+        let Outcome::Analyzed {
+            version,
+            range,
+            highlights,
+            folds,
+        } = outcome
+        else {
+            return false;
+        };
+        // An answer for a version the document has moved past is dropped;
+        // a newer request is already on its way.
+        if version != self.display.snapshot().version() {
+            return false;
+        }
+        if let Some(result) = highlights {
             let _ = self.highlights.accept_range(result);
         }
-        let line_start = first.buffer_line;
-        let line_end = last.buffer_line.saturating_add(1);
-        if let Ok(folds) = self
-            .highlighter
-            .fold_ranges(self.display.snapshot(), requested.clone())
-        {
+        if let Some(folds) = folds {
+            let map = self.display.snapshot().position_map();
+            let line_start = map.byte_to_line(range.start).unwrap_or(0);
+            let line_end = map.byte_to_line(range.end).unwrap_or(line_start) + 1;
             self.display.set_foldable_regions_in_line_range(
                 line_start..line_end,
                 folds.into_iter().map(|fold| {
@@ -1398,7 +1439,16 @@ impl EditorSurface {
                 }),
             );
         }
-        self.language_coverage = Some((document_version, requested));
+        self.language_coverage = Some((version, range));
+        if self
+            .language_requested
+            .as_ref()
+            .is_some_and(|(requested, _)| *requested == version)
+        {
+            self.language_requested = None;
+        }
+        self.invalidation.push(InvalidationKind::Decoration, None);
+        true
     }
 }
 
@@ -1435,7 +1485,7 @@ pub struct DiffSplitSurface {
 }
 
 impl DiffSplitSurface {
-    pub fn new(original: &DocumentSnapshot, modified_text: impl Into<String>) -> Self {
+    pub fn new(original: &DocumentSnapshot, modified_text: impl Into<mockaco_core::Text>) -> Self {
         let editor = DiffEditor::new(original, modified_text);
         let scroll =
             DiffScrollState::new(DiffScrollMode::Synchronized, editor.diff().rows().len(), 0);
@@ -1608,11 +1658,11 @@ fn char_class(character: char) -> CharClass {
 
 /// Next word boundary from `from`: skip whitespace, then one run of a single
 /// character class.
-fn word_boundary(text: &str, from: usize, forward: bool) -> usize {
+fn word_boundary(text: &mockaco_core::Text, from: usize, forward: bool) -> usize {
     let from = from.min(text.len());
     if forward {
         let mut index = from;
-        let mut chars = text[from..].chars().peekable();
+        let mut chars = text.chars_from(from).map(|(_, c)| c).peekable();
         while let Some(character) = chars.next_if(|c| char_class(*c) == CharClass::Space) {
             index += character.len_utf8();
         }
@@ -1624,7 +1674,7 @@ fn word_boundary(text: &str, from: usize, forward: bool) -> usize {
         index
     } else {
         let mut index = from;
-        let mut chars = text[..from].chars().rev().peekable();
+        let mut chars = text.chars_before(from).map(|(_, c)| c).peekable();
         while let Some(character) = chars.next_if(|c| char_class(*c) == CharClass::Space) {
             index -= character.len_utf8();
         }
@@ -1758,7 +1808,7 @@ impl InputRouter {
         &mut self,
         surface: &mut EditorSurface,
         extend: bool,
-        target: impl Fn(&str, usize) -> usize,
+        target: impl Fn(&mockaco_core::Text, usize) -> usize,
     ) -> Result<InputOutcome, SurfaceError> {
         let text = surface.editor.document().text();
         let next = surface
@@ -1834,13 +1884,19 @@ impl InputRouter {
             let range = selection.ordered_range();
             let line = map.byte_to_line(range.start).unwrap_or(0);
             let line_start = map.line_start(line).unwrap_or(0);
-            let before_caret = &text[line_start..range.start];
-            let leading: String = before_caret
-                .chars()
-                .take_while(|c| *c == ' ' || *c == '\t')
+            // Only the indentation and the characters next to the caret are
+            // read, however long the line is.
+            let leading: String = text
+                .chars_from(line_start)
+                .take_while(|(offset, c)| *offset < range.start && (*c == ' ' || *c == '\t'))
+                .map(|(_, c)| c)
                 .collect();
-            let before = before_caret.trim_end().chars().last();
-            let after = text[range.end..].chars().next();
+            let before = text
+                .chars_before(range.start)
+                .take_while(|(offset, _)| *offset >= line_start)
+                .map(|(_, c)| c)
+                .find(|c| !c.is_whitespace());
+            let after = text.char_at(range.end);
             let opens = matches!(before, Some('{' | '(' | '['));
             let closes = matches!(
                 (before, after),
@@ -1899,8 +1955,10 @@ impl InputRouter {
                 let range = selection.ordered_range();
                 let line = map.byte_to_line(range.start).unwrap_or(0);
                 let line_start = map.line_start(line).unwrap_or(0);
-                let column = text[line_start..range.start]
-                    .chars()
+                let column = text
+                    .chars_from(line_start)
+                    .take_while(|(offset, _)| *offset < range.start)
+                    .map(|(_, c)| c)
                     .fold(0, |column, c| {
                         column + if c == '\t' { width - column % width } else { 1 }
                     });
@@ -1967,11 +2025,11 @@ impl InputRouter {
             .iter()
             .filter_map(|line| {
                 let start = map.line_start(*line).ok()?;
-                let leading = &text[start..];
-                let removable = if leading.starts_with('\t') {
+                let mut leading = text.chars_from(start).map(|(_, c)| c).peekable();
+                let removable = if leading.peek() == Some(&'\t') {
                     1
                 } else {
-                    leading.bytes().take(width).take_while(|b| *b == b' ').count()
+                    leading.take(width).take_while(|c| *c == ' ').count()
                 };
                 (removable > 0).then(|| Edit::delete(start..start + removable))
             })
@@ -2128,14 +2186,11 @@ impl InputRouter {
                 return Some(range);
             }
             if backward {
-                text[..selection.head]
-                    .char_indices()
-                    .next_back()
+                text.chars_before(selection.head)
+                    .next()
                     .map(|(offset, _)| offset..selection.head)
             } else {
-                text[selection.head..]
-                    .chars()
-                    .next()
+                text.char_at(selection.head)
                     .map(|character| selection.head..selection.head + character.len_utf8())
             }
         });
@@ -2185,7 +2240,7 @@ impl InputRouter {
                 .line_end(line)
                 .unwrap_or(selection.cursor());
             if end < text.len() {
-                end += text[end..].chars().next().map_or(0, char::len_utf8);
+                end += text.char_at(end).map_or(0, char::len_utf8);
             }
             if start != end {
                 edits.push(Edit::delete(start..end));
@@ -2231,15 +2286,12 @@ impl InputRouter {
                     selection.head
                 };
                 let target = if right {
-                    text[cursor..]
-                        .chars()
-                        .next()
+                    text.char_at(cursor)
                         .map(|character| cursor + character.len_utf8())
                         .unwrap_or(cursor)
                 } else {
-                    text[..cursor]
-                        .char_indices()
-                        .next_back()
+                    text.chars_before(cursor)
+                        .next()
                         .map(|(offset, _)| offset)
                         .unwrap_or(0)
                 };
@@ -2285,8 +2337,7 @@ impl InputRouter {
             let target_column = (*desired).min(
                 surface
                     .display
-                    .rows()
-                    .get(row)
+                    .row(row)
                     .map_or(0, |display_row| display_row.display_width),
             );
             let target = surface
@@ -2334,7 +2385,7 @@ impl InputRouter {
                     .buffer_to_display(selection.head, Affinity::After)
                     .ok()
                     .and_then(|point| {
-                        let row = &surface.display.rows()[point.row];
+                        let row = surface.display.row(point.row)?;
                         surface
                             .display
                             .display_to_buffer(
@@ -2449,7 +2500,9 @@ impl InputRouter {
                         }
                     } else if x >= GUTTER_MARKER_WIDTH {
                         // Line-number column: select the whole line.
-                        let line = surface.display.rows()[row].buffer_line;
+                        let Some(line) = surface.display.row(row).map(|row| row.buffer_line) else {
+                            return Ok(InputOutcome::handled());
+                        };
                         surface.select_line_at(line);
                         self.drag_anchor = None;
                         return Ok(InputOutcome {
@@ -2548,7 +2601,7 @@ fn mouse_to_byte(surface: &EditorSurface, x: f32, y: f32) -> Result<usize, Surfa
     // glyph places the caret after it.
     let column = ((code_x / surface.geometry.character_width.max(1.0)) + 0.5).floor() as usize
         + surface.scroll.horizontal_columns;
-    let column = column.min(surface.display.rows()[row].display_width);
+    let column = column.min(surface.display.row(row).map_or(0, |row| row.display_width));
     surface
         .display
         .display_to_buffer(DisplayPoint { row, column }, Affinity::Before)
@@ -2556,14 +2609,21 @@ fn mouse_to_byte(surface: &EditorSurface, x: f32, y: f32) -> Result<usize, Surfa
         .map_err(SurfaceError::Display)
 }
 
-fn indent_guides_for_line(text: &str, start: usize, end: usize, tab_width: usize) -> Vec<usize> {
-    let Some(line) = text.get(start.min(text.len())..end.min(text.len())) else {
+/// Indent guide columns for the line `start..end` of `text`. Reads only the
+/// leading whitespace, however long the line is.
+fn indent_guides_for_line(text: &mockaco_core::Text, start: usize, end: usize, tab_width: usize) -> Vec<usize> {
+    let end = end.min(text.len());
+    if start > end || !text.is_char_boundary(start) {
         return Vec::new();
-    };
+    }
     let tab_width = tab_width.max(1);
     let mut column = 0;
     let mut first_code_column = None;
-    for character in line.chars() {
+    for character in text
+        .chars_from(start)
+        .take_while(|(offset, _)| *offset < end)
+        .map(|(_, character)| character)
+    {
         match character {
             ' ' => column += 1,
             '\t' => column += tab_width - (column % tab_width),
@@ -2906,6 +2966,7 @@ mod tests {
             DisplayConfig::unwrapped(),
             SurfaceGeometry::default(),
         );
+        surface.flush_language();
         assert!(surface.display().gutter(GUTTER_MIN_DIGITS).rows[0].foldable);
         let chevron_x = surface.gutter_width() - 4.0;
         let mut router = InputRouter::default();
@@ -2945,6 +3006,7 @@ mod tests {
             Selection::range(0, 2),
             Selection::caret(3),
         ]));
+        surface.flush_language();
         let frame = surface.render_frame();
         assert!(frame.rows.iter().any(|row| !row.tokens.is_empty()));
         assert!(frame.rows.iter().any(|row| row.active));
@@ -2962,14 +3024,15 @@ mod tests {
             EditorSurface::new(text, DisplayConfig::unwrapped(), SurfaceGeometry::default());
         surface.set_viewport(20, 120);
         surface.scroll_to(39_990, 0);
+        surface.flush_language();
 
         let frame = surface.render_frame_with_buffer(1);
         assert!(frame.rows.len() <= 22);
         assert_eq!(frame.rows.len(), frame.gutter.rows.len());
         assert!(frame.rows.iter().any(|row| !row.tokens.is_empty()));
-        // Only the padded viewport window is highlighted, never the whole
-        // 40k-line document (which would hold hundreds of thousands).
-        assert!(surface.highlights.tokens().len() < 3_000);
+        // At most a couple of padded windows (the first one may still be
+        // cached), never the whole document (~400k tokens).
+        assert!(surface.highlights.tokens().len() < 10_000);
         assert!(frame.decorations.iter().all(|decoration| frame
             .rows
             .iter()

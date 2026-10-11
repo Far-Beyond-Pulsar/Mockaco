@@ -37,11 +37,11 @@ fn editing_selection_ime_and_undo_are_fixture_locked() {
     editor.update_composition(1..1, "😀").unwrap();
     assert_eq!(editor.document().text(), "xone two!");
     editor.commit_composition().unwrap();
-    assert!(editor.document().text().contains("😀"));
+    assert!(editor.document().text().to_string().contains("😀"));
     assert!(editor.undo());
     assert_eq!(editor.document().text(), "xone two!");
     assert!(editor.redo());
-    assert!(editor.document().text().contains("😀"));
+    assert!(editor.document().text().to_string().contains("😀"));
     editor.update_composition(1..5, "cancelled").unwrap();
     assert!(editor.cancel_composition());
     assert!(editor.pending_composition().is_none());
@@ -74,7 +74,10 @@ fn search_replace_folding_wrapping_and_pathological_lines_are_bounded() {
         )),
     );
     assert!(bounded.row_count() <= 9);
-    assert!(bounded.rows().iter().any(|row| row.truncated));
+    assert!(bounded
+        .rows_in(0..bounded.row_count())
+        .iter()
+        .any(|row| row.truncated));
 }
 
 #[test]
