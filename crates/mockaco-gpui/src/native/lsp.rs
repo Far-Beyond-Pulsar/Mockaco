@@ -57,6 +57,9 @@ pub(super) struct Intel {
 
     completion: Option<Rc<RefCell<CompletionSession>>>,
     completion_scroll: UniformListScrollHandle,
+    /// Extra trigger characters the host's server registered, on top of the
+    /// built-in ones.
+    completion_triggers: Vec<char>,
     completion_docs: Option<DocsPanel>,
     completion_request: u64,
     completion_anchor: usize,
@@ -81,6 +84,7 @@ impl Default for Intel {
             card_hovered: false,
             completion: None,
             completion_scroll: UniformListScrollHandle::new(),
+            completion_triggers: Vec::new(),
             completion_docs: None,
             completion_request: 0,
             completion_anchor: 0,
@@ -301,6 +305,13 @@ impl WgpuiEditorView {
             cx.emit(EditorEvent::Changed);
             cx.notify();
         }
+    }
+
+    /// Adds the language server's own completion trigger characters (its
+    /// `completionProvider.triggerCharacters`) to the built-in set, so whatever
+    /// a server registers opens the menu.
+    pub fn set_completion_triggers(&mut self, triggers: Vec<char>) {
+        self.intel.completion_triggers = triggers;
     }
 
     /// Number of entries in the open completion menu (0 when closed).
@@ -539,6 +550,9 @@ impl WgpuiEditorView {
     /// being started: member access, paths, and the separators and openers
     /// after which a new expression or argument begins.
     fn is_trigger(&self, c: char, caret: usize) -> bool {
+        if self.intel.completion_triggers.contains(&c) && c != ':' {
+            return true;
+        }
         match c {
             '.' | ',' | ' ' | '(' | '[' | '{' | '=' | '<' | '&' | '!' => true,
             ':' => caret >= 2 && self.surface.document().text().char_at(caret - 2) == Some(':'),
