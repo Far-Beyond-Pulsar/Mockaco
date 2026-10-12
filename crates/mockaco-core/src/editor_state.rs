@@ -1,6 +1,6 @@
 use crate::{
-    Document, DocumentSnapshot, Grouping, Selection, SelectionSet, Transaction, TransactionError,
-    UndoHistory,
+    AppliedTransaction, Document, DocumentSnapshot, Grouping, HistoryAction, HistoryStep,
+    Selection, SelectionSet, Transaction, TransactionError, UndoHistory,
 };
 use std::fmt;
 use std::ops::Range;
@@ -39,6 +39,18 @@ impl fmt::Display for ImeError {
 }
 
 impl std::error::Error for ImeError {}
+
+/// How an undo or redo changed the document.
+#[derive(Debug, Clone)]
+pub enum HistoryChange {
+    /// The entry's edits were replayed, oldest first. Each carries its change
+    /// map, so layout, highlighting and language servers can follow
+    /// incrementally, as they do for typing.
+    Edits(Vec<AppliedTransaction>),
+    /// The document was replaced with the entry's snapshot: the entry had no
+    /// recorded edits. Everything derived from the text must be rebuilt.
+    Replaced,
+}
 
 /// The framework-neutral state needed to connect a document to a renderer.
 #[derive(Debug, Clone)]
@@ -120,34 +132,69 @@ impl EditorState {
         let applied = self.document.apply(transaction)?;
         self.selections = self.selections.map(&applied.change_map);
         let after = self.document.snapshot();
-        self.undo.record(
+        self.undo.record_step(
             before,
             after,
             before_selections,
             self.selections.clone(),
+            HistoryStep {
+                forward: transaction.clone(),
+                inverse: applied.inverse.clone(),
+            },
             grouping,
         );
         Ok(applied)
     }
 
     pub fn undo(&mut self) -> bool {
-        let Some(action) = self.undo.undo() else {
-            return false;
-        };
-        self.document = Document::from_snapshot(&action.snapshot);
-        self.selections = action.selections;
-        self.pending_composition = None;
-        true
+        self.undo_with_result().is_some()
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(action) = self.undo.redo() else {
-            return false;
-        };
-        self.document = Document::from_snapshot(&action.snapshot);
-        self.selections = action.selections;
+        self.redo_with_result().is_some()
+    }
+
+    /// Undoes the last history entry and reports how the document changed,
+    /// so a caller can update what it derives from the text incrementally.
+    /// `None` if there is nothing to undo.
+    pub fn undo_with_result(&mut self) -> Option<HistoryChange> {
+        let action = self.undo.undo()?;
+        Some(self.restore(action))
+    }
+
+    /// Redoes the next history entry; see [`Self::undo_with_result`].
+    pub fn redo_with_result(&mut self) -> Option<HistoryChange> {
+        let action = self.undo.redo()?;
+        Some(self.restore(action))
+    }
+
+    /// Brings the document to `action.snapshot` by replaying its edits, or
+    /// by replacing the document when it has none (or they no longer apply).
+    /// Either way the version moves forward, never back to the snapshot's, so
+    /// anything keyed on versions can't mistake the result for an older or
+    /// discarded document.
+    fn restore(&mut self, action: HistoryAction) -> HistoryChange {
         self.pending_composition = None;
-        true
+        if let Some(transactions) = action.transactions {
+            let start = self.document.clone();
+            let mut applied = Vec::with_capacity(transactions.len());
+            let replayed = transactions.iter().try_for_each(|transaction| {
+                applied.push(self.document.apply(transaction)?);
+                Ok::<_, TransactionError>(())
+            });
+            if replayed.is_ok() && self.document.len_bytes() == action.snapshot.len_bytes() {
+                self.selections = action.selections;
+                return HistoryChange::Edits(applied);
+            }
+            self.document = start;
+        }
+        let version = self.document.version().saturating_add(1);
+        self.document = Document::from_snapshot(&Document::snapshot_with_version(
+            action.snapshot.text().clone(),
+            version,
+        ));
+        self.selections = action.selections;
+        HistoryChange::Replaced
     }
 
     pub fn update_composition(

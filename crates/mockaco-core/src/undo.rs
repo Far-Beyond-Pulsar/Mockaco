@@ -1,4 +1,4 @@
-use crate::{DocumentSnapshot, SelectionSet};
+use crate::{DocumentSnapshot, SelectionSet, Transaction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Grouping {
@@ -12,12 +12,28 @@ pub struct HistoryEntry {
     pub after: DocumentSnapshot,
     pub before_selections: SelectionSet,
     pub after_selections: SelectionSet,
+    /// The edits that produced this entry, oldest first, so undo and redo can
+    /// replay them instead of replacing the document. `None` when the entry
+    /// was recorded from snapshots alone ([`UndoHistory::push`]).
+    pub steps: Option<Vec<HistoryStep>>,
+}
+
+/// One recorded edit and the edit that reverts it.
+#[derive(Debug, Clone)]
+pub struct HistoryStep {
+    pub forward: Transaction,
+    pub inverse: Transaction,
 }
 
 #[derive(Debug, Clone)]
 pub struct HistoryAction {
+    /// The document the action restores.
     pub snapshot: DocumentSnapshot,
     pub selections: SelectionSet,
+    /// Edits that turn the current document into `snapshot`, in order. `None`
+    /// when the entry has no recorded edits; the caller then replaces the
+    /// document with `snapshot`.
+    pub transactions: Option<Vec<Transaction>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -81,6 +97,52 @@ impl UndoHistory {
         if before.text() == after.text() && before_selections == after_selections {
             return;
         }
+        self.record_entry(
+            before,
+            after,
+            before_selections,
+            after_selections,
+            None,
+            grouping,
+        );
+    }
+
+    /// Records an edit made by `step.forward`, so undo and redo replay edits
+    /// rather than swap documents: the caller can then update anything keyed
+    /// on the text (layout, highlighting, language servers) incrementally.
+    pub fn record_step(
+        &mut self,
+        before: DocumentSnapshot,
+        after: DocumentSnapshot,
+        before_selections: SelectionSet,
+        after_selections: SelectionSet,
+        step: HistoryStep,
+        grouping: Grouping,
+    ) {
+        // An empty transaction changes nothing; comparing the texts instead
+        // would read both whole documents on every keystroke.
+        if step.forward.is_empty() && before_selections == after_selections {
+            return;
+        }
+        self.record_entry(
+            before,
+            after,
+            before_selections,
+            after_selections,
+            Some(step),
+            grouping,
+        );
+    }
+
+    fn record_entry(
+        &mut self,
+        before: DocumentSnapshot,
+        after: DocumentSnapshot,
+        before_selections: SelectionSet,
+        after_selections: SelectionSet,
+        step: Option<HistoryStep>,
+        grouping: Grouping,
+    ) {
         if self.cursor < self.entries.len() {
             self.entries.truncate(self.cursor);
         }
@@ -94,6 +156,11 @@ impl UndoHistory {
             if let Some(last) = self.entries.last_mut() {
                 last.after = after;
                 last.after_selections = after_selections;
+                // A group replays as edits only if every member was one.
+                match (&mut last.steps, step) {
+                    (Some(steps), Some(step)) => steps.push(step),
+                    (steps, _) => *steps = None,
+                }
                 self.cursor = self.entries.len();
                 return;
             }
@@ -103,6 +170,7 @@ impl UndoHistory {
             after,
             before_selections,
             after_selections,
+            steps: step.map(|step| vec![step]),
         });
         self.cursor = self.entries.len();
         if self.grouping {
@@ -129,6 +197,13 @@ impl UndoHistory {
         Some(HistoryAction {
             snapshot: entry.before.clone(),
             selections: entry.before_selections.clone(),
+            transactions: entry.steps.as_ref().map(|steps| {
+                steps
+                    .iter()
+                    .rev()
+                    .map(|step| step.inverse.clone())
+                    .collect()
+            }),
         })
     }
 
@@ -141,6 +216,10 @@ impl UndoHistory {
         Some(HistoryAction {
             snapshot: entry.after.clone(),
             selections: entry.after_selections.clone(),
+            transactions: entry
+                .steps
+                .as_ref()
+                .map(|steps| steps.iter().map(|step| step.forward.clone()).collect()),
         })
     }
 

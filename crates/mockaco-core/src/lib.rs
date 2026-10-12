@@ -17,7 +17,7 @@ mod undo;
 
 pub use diagnostics::{Diagnostic, DiagnosticError, DiagnosticSet, DiagnosticSeverity};
 pub use document::{Document, DocumentError, DocumentSnapshot};
-pub use editor_state::{EditorState, ImeComposition, ImeError, ViewportIntent};
+pub use editor_state::{EditorState, HistoryChange, ImeComposition, ImeError, ViewportIntent};
 pub use lifecycle::{
     CloseDecision, CloseOutcome, ContentIdentity, DocumentLocation, DocumentMetadata,
     DocumentSession, EncodingMetadata, ExternalChange, ExternalChangeDecision, ExternalChangeError,
@@ -34,7 +34,7 @@ pub use text::{ByteChunks, CharIndices, Text};
 pub use transaction::{
     Affinity, AppliedTransaction, ChangeMap, Edit, EditError, Transaction, TransactionError,
 };
-pub use undo::{Grouping, HistoryAction, HistoryEntry, UndoHistory};
+pub use undo::{Grouping, HistoryAction, HistoryEntry, HistoryStep, UndoHistory};
 
 #[cfg(test)]
 mod tests {
@@ -157,6 +157,64 @@ mod tests {
             .unwrap();
         assert!(!state.undo_history().can_redo());
         assert_eq!(state.document().text(), "x");
+    }
+
+    #[test]
+    fn undo_and_redo_replay_edits_and_versions_only_grow() {
+        let mut state = EditorState::new("fn main() {}\n");
+        state.begin_undo_group();
+        state
+            .apply(&Transaction::new().insert(11, " body "), Grouping::Separate)
+            .unwrap();
+        state
+            .apply(
+                &Transaction::new()
+                    .replace(3..7, "start")
+                    .insert(0, "// x\n"),
+                Grouping::Separate,
+            )
+            .unwrap();
+        state.end_undo_group();
+        let edited = state.document().text().to_string();
+        assert_eq!(edited, "// x\nfn start() { body }\n");
+        let mut last_version = state.document().version();
+
+        let Some(HistoryChange::Edits(undone)) = state.undo_with_result() else {
+            panic!("an edited entry undoes as edits");
+        };
+        assert_eq!(
+            undone.len(),
+            2,
+            "one inverse per recorded edit, newest first"
+        );
+        assert_eq!(state.document().text(), "fn main() {}\n");
+        assert!(
+            state.document().version() > last_version,
+            "undo moves the version forward"
+        );
+        assert_eq!(
+            undone.last().unwrap().after_version,
+            state.document().version()
+        );
+        last_version = state.document().version();
+
+        let Some(HistoryChange::Edits(redone)) = state.redo_with_result() else {
+            panic!("an edited entry redoes as edits");
+        };
+        assert_eq!(redone.len(), 2);
+        assert_eq!(state.document().text(), edited.as_str());
+        assert!(state.document().version() > last_version);
+
+        // An entry recorded from snapshots alone still undoes, by replacement.
+        let before = state.snapshot();
+        let mut replaced = state.document().clone();
+        replaced
+            .apply(&Transaction::new().replace(0..5, ""))
+            .unwrap();
+        let mut history = UndoHistory::new();
+        history.push(before, replaced.snapshot());
+        let action = history.undo().unwrap();
+        assert!(action.transactions.is_none());
     }
 
     #[test]
