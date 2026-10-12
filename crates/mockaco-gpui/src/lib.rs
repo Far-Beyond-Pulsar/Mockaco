@@ -5,8 +5,8 @@
 //! `native-wgpui` module is the only place that imports the real WGPUI crate.
 
 use mockaco_core::{
-    Affinity, DiagnosticSet, DocumentSnapshot, Edit, EditorState, Grouping, SearchSession,
-    Selection, SelectionSet, Transaction, TransactionError,
+    Affinity, DiagnosticSet, DocumentSnapshot, Edit, EditorState, Grouping, HistoryChange,
+    SearchSession, Selection, SelectionSet, Transaction, TransactionError,
 };
 use mockaco_diff::{
     DiffEditor, DiffError, DiffPosition, DiffResult, DiffRowKind, DiffScrollMode, DiffScrollState,
@@ -806,21 +806,24 @@ impl EditorSurface {
         self.invalidation.push(InvalidationKind::Document, None);
     }
 
-    /// Applies an undo and rebuilds the renderer-neutral display map.
+    /// Applies an undo, updating the display, highlighting and language
+    /// servers incrementally, as an edit does.
     pub fn undo(&mut self) -> bool {
-        if !self.editor.undo() {
+        let before = self.editor.snapshot();
+        let Some(change) = self.editor.undo_with_result() else {
             return false;
-        }
-        self.rebuild_display_after_history_change();
+        };
+        self.follow_history_change(before, change);
         true
     }
 
-    /// Applies a redo and rebuilds the renderer-neutral display map.
+    /// Applies a redo; see [`Self::undo`].
     pub fn redo(&mut self) -> bool {
-        if !self.editor.redo() {
+        let before = self.editor.snapshot();
+        let Some(change) = self.editor.redo_with_result() else {
             return false;
-        }
-        self.rebuild_display_after_history_change();
+        };
+        self.follow_history_change(before, change);
         true
     }
 
@@ -1241,14 +1244,35 @@ impl EditorSurface {
     ) -> Result<mockaco_core::AppliedTransaction, SurfaceError> {
         let before_snapshot = self.editor.snapshot();
         let applied = self.editor.apply_with_result(transaction, grouping)?;
-        self.record_changes(&before_snapshot, &applied);
-        let snapshot = self.editor.snapshot();
+        self.follow_edit(&before_snapshot, &applied)?;
+        Ok(applied)
+    }
+
+    /// Brings everything derived from the text up to date with one applied
+    /// edit: language-server changes, the display map, highlight tokens, the
+    /// parser and diagnostics, each updated in place. Typing, undo and redo
+    /// all come through here, so none of them costs time in the file's size.
+    fn follow_edit(
+        &mut self,
+        before_snapshot: &DocumentSnapshot,
+        applied: &mockaco_core::AppliedTransaction,
+    ) -> Result<(), SurfaceError> {
+        self.record_changes(before_snapshot, applied);
+        // The editor's own snapshot when this is its latest edit (it shares
+        // the document's allocation); an undo's earlier steps are rebuilt.
+        let current = self.editor.snapshot();
+        let snapshot = if current.version() == applied.after_version {
+            current
+        } else {
+            applied.snapshot()
+        };
         // Updated in place: cloning a million-row display map per keystroke
         // costs more than the update itself. Should the update fail part-way,
         // the map is rebuilt from the new snapshot so it is never torn.
-        let update = match self.display.update(&snapshot, &applied) {
+        let update = match self.display.update(&snapshot, applied) {
             Ok(update) => update,
             Err(error) => {
+                let snapshot = self.editor.snapshot();
                 let config = self.display.config().clone();
                 let folds = self.display.folds().clone();
                 self.display = DisplayMap::with_folds(&snapshot, config, folds);
@@ -1260,13 +1284,15 @@ impl EditorSurface {
         };
         // Existing tokens are shifted through the edit and painted until the
         // worker's fresh ones arrive, so typing never flashes uncolored text.
-        let _ = self
-            .highlights
-            .apply_transaction(&before_snapshot, &applied);
+        let _ = self.highlights.apply_transaction(before_snapshot, applied);
         self.language_coverage = None;
         self.language_requested = None;
         if let Some(worker) = &mut self.language_worker {
-            worker.edit(before_snapshot, snapshot, applied.change_map.clone());
+            worker.edit(
+                before_snapshot.clone(),
+                snapshot,
+                applied.change_map.clone(),
+            );
         }
         self.recompute_scroll_viewport();
         self.ensure_language_state_for_viewport();
@@ -1275,7 +1301,26 @@ impl EditorSurface {
         if !self.lsp_diagnostics.is_empty() {
             self.map_diagnostics(&applied.change_map);
         }
-        Ok(applied)
+        Ok(())
+    }
+
+    /// Follows an undo or redo. Replayed edits go through [`Self::follow_edit`]
+    /// like typing; a wholesale replacement rebuilds.
+    fn follow_history_change(&mut self, before: DocumentSnapshot, change: HistoryChange) {
+        let HistoryChange::Edits(applied) = change else {
+            self.rebuild_display_after_history_change();
+            return;
+        };
+        let mut before = before;
+        for step in &applied {
+            if self.follow_edit(&before, step).is_err() {
+                // follow_edit rebuilt the display; the rest of the text state
+                // must be rebuilt too.
+                self.rebuild_display_after_history_change();
+                return;
+            }
+            before = step.snapshot();
+        }
     }
 
     pub fn commit_composition(&mut self) -> Result<bool, SurfaceError> {
@@ -3569,16 +3614,85 @@ mod tests {
     }
 
     #[test]
-    fn history_and_replacement_force_a_full_sync() {
+    fn undo_and_redo_sync_incrementally_and_replacement_fully() {
         let mut surface = surface("abc");
         surface
             .apply_transaction(&Transaction::new().insert(3, "d"), Grouping::Separate)
             .unwrap();
+        let _ = surface.take_pending_sync();
+
         assert!(surface.undo());
-        assert_eq!(surface.take_pending_sync(), PendingSync::Full);
+        let PendingSync::Incremental(changes) = surface.take_pending_sync() else {
+            panic!("undo replays the edit, so the server gets just that change");
+        };
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].text, "");
+        assert_eq!(
+            changes[0].start,
+            mockaco_core::TextPosition { line: 0, column: 3 }
+        );
+        assert_eq!(
+            changes[0].end,
+            mockaco_core::TextPosition { line: 0, column: 4 }
+        );
         assert_eq!(surface.take_pending_sync(), PendingSync::None);
+
+        assert!(surface.redo());
+        let PendingSync::Incremental(changes) = surface.take_pending_sync() else {
+            panic!("redo replays the edit too");
+        };
+        assert_eq!(changes[0].text, "d");
+        assert_eq!(surface.editor().document().text(), "abcd");
+
         surface.replace_text("new");
         assert_eq!(surface.take_pending_sync(), PendingSync::Full);
+    }
+
+    #[test]
+    fn undo_in_a_large_document_updates_in_place() {
+        let text = (0..40_000)
+            .map(|line| format!("fn item_{line}() {{ let value = {line}; }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut surface = EditorSurface::new(
+            text.clone(),
+            DisplayConfig::unwrapped(),
+            SurfaceGeometry::default(),
+        );
+        surface.set_viewport(20, 120);
+        surface.scroll_to(39_990, 0);
+        surface.flush_language();
+        let edit_at = surface.editor().document().len_bytes() - 3;
+        surface
+            .apply_transaction(
+                &Transaction::new().insert(edit_at, "\nfn added() {}"),
+                Grouping::Separate,
+            )
+            .unwrap();
+        surface.flush_language();
+        let _ = surface.take_invalidations();
+        let version = surface.editor().document().version();
+
+        assert!(surface.undo());
+        assert_eq!(surface.editor().document().text(), text.as_str());
+        assert!(
+            surface.editor().document().version() > version,
+            "undo moves the version forward"
+        );
+        // Only the edited rows are invalidated, not the whole document, and
+        // the shifted tokens still paint before the worker answers.
+        let batch = surface.take_invalidations();
+        let document = batch
+            .invalidations
+            .iter()
+            .filter(|invalidation| invalidation.kind == InvalidationKind::Document)
+            .collect::<Vec<_>>();
+        assert!(!document.is_empty());
+        assert!(document
+            .iter()
+            .all(|invalidation| invalidation.rows.is_some()));
+        let frame = surface.render_frame_with_buffer(1);
+        assert!(frame.rows.iter().any(|row| !row.tokens.is_empty()));
     }
 
     #[test]
