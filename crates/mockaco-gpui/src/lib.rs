@@ -20,7 +20,7 @@ use mockaco_language::{
 use mockaco_renderer::{
     diagnostic_decorations, search_decorations, Decoration, DisplayMap, DisplayMapError,
     DIAGNOSTIC_ERROR_STYLE_ID, DIAGNOSTIC_HINT_STYLE_ID, DIAGNOSTIC_INFO_STYLE_ID,
-    DIAGNOSTIC_WARNING_STYLE_ID,
+    DIAGNOSTIC_WARNING_STYLE_ID, SEARCH_CURRENT_MATCH_STYLE_ID, SEARCH_MATCH_STYLE_ID,
     DisplayPoint, DisplayViewport, GutterLayout, ProjectedDecoration,
 };
 use std::fmt;
@@ -959,6 +959,22 @@ impl EditorSurface {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Shows `search`'s matches (the current one stronger), replacing the
+    /// previous search's and keeping every other decoration (diagnostics,
+    /// host styles). `None` clears them.
+    pub fn set_search(&mut self, search: Option<&SearchSession>) {
+        let mut decorations: Vec<Decoration> = self
+            .decorations
+            .iter()
+            .filter(|decoration| !is_search_style(decoration.style.id))
+            .cloned()
+            .collect();
+        if let Some(search) = search {
+            decorations.extend(search_decorations(search));
+        }
+        self.set_decorations(decorations);
     }
 
     pub fn set_search_and_diagnostic_decorations(
@@ -1900,6 +1916,10 @@ fn paint_diff_row(result: &DiffResult, row: usize, side: DiffSide) -> DiffPaintR
         kind: diff_row.kind,
         hunk: diff_row.hunk,
     }
+}
+
+fn is_search_style(id: u32) -> bool {
+    matches!(id, SEARCH_MATCH_STYLE_ID | SEARCH_CURRENT_MATCH_STYLE_ID)
 }
 
 fn is_diagnostic_style(id: u32) -> bool {

@@ -21,7 +21,10 @@ use crate::{
 };
 mod lsp;
 use self::lsp::{EditKind, Intel};
-use mockaco_core::{Affinity, SelectionSet, TextPosition};
+use mockaco_core::{
+    Affinity, CaseSensitivity, Edit, Grouping, SearchQuery, SearchSession, Selection, SelectionSet,
+    TextPosition, Transaction,
+};
 use mockaco_renderer::{
     DIAGNOSTIC_ERROR_STYLE_ID, DIAGNOSTIC_HINT_STYLE_ID, DIAGNOSTIC_INFO_STYLE_ID,
     DIAGNOSTIC_WARNING_STYLE_ID, SEARCH_CURRENT_MATCH_STYLE_ID, SEARCH_MATCH_STYLE_ID,
@@ -154,6 +157,8 @@ pub struct WgpuiEditorView {
     always_show_fold_controls: bool,
     minimap_buffer: Option<Rc<MinimapBuffer<MinimapKey>>>,
     intel: Intel,
+    /// The find session: its matches are highlighted until [`Self::clear_find`].
+    search: Option<SearchSession>,
 }
 
 impl EventEmitter<EditorEvent> for WgpuiEditorView {}
@@ -197,6 +202,7 @@ impl WgpuiEditorView {
             always_show_fold_controls: true,
             minimap_buffer: None,
             intel: Intel::default(),
+            search: None,
         }
     }
 
@@ -293,12 +299,21 @@ impl WgpuiEditorView {
         self.surface
             .editor_mut()
             .set_selections(SelectionSet::caret(caret));
-        if let Ok(point) = self.surface.display().buffer_to_display(caret, Affinity::After) {
+        self.center_on(caret);
+        cx.notify();
+    }
+
+    /// Scrolls `byte`'s row to the middle of the viewport.
+    fn center_on(&mut self, byte: usize) {
+        if let Ok(point) = self
+            .surface
+            .display()
+            .buffer_to_display(byte, Affinity::After)
+        {
             let rows = self.layout.viewport_height / self.line_height;
             self.y_scroll
                 .scroll_to((point.row as f32 - rows / 2.0 + 0.5).max(0.0) * self.line_height);
         }
-        cx.notify();
     }
 
     // ---- commands (menus, toolbars) ----------------------------------------
@@ -373,6 +388,233 @@ impl WgpuiEditorView {
 
     pub fn line_count(&self) -> usize {
         self.surface.document().position_map().line_count()
+    }
+
+    /// Adds a caret one row above the topmost cursor (`above`), or below the
+    /// bottom-most one: the Ctrl+Alt+Up/Down commands.
+    pub fn add_cursor(&mut self, above: bool, cx: &mut Context<Self>) {
+        self.route(
+            InputEvent::Key(KeyEvent {
+                key: if above { Key::Up } else { Key::Down },
+                modifiers: KeyModifiers {
+                    control: true,
+                    alt: true,
+                    ..KeyModifiers::default()
+                },
+            }),
+            cx,
+        );
+    }
+
+    // ---- find / replace ---------------------------------------------------
+
+    /// Searches for `pattern`, highlights every match and selects the first
+    /// one at or after the caret. An empty pattern clears the search.
+    /// Returns the number of matches.
+    pub fn find(&mut self, pattern: &str, case_sensitive: bool, cx: &mut Context<Self>) -> usize {
+        if pattern.is_empty() {
+            self.clear_find(cx);
+            return 0;
+        }
+        let query = SearchQuery::new(pattern).case_sensitivity(if case_sensitive {
+            CaseSensitivity::Sensitive
+        } else {
+            CaseSensitivity::Insensitive
+        });
+        let snapshot = self.surface.editor().snapshot();
+        let mut session = SearchSession::new(&snapshot, query);
+        let caret = self
+            .surface
+            .editor()
+            .selections()
+            .primary()
+            .map_or(0, |selection| selection.ordered_range().start);
+        // Start just before the first match at or after the caret, so
+        // `next_match` lands on it (wrapping to the first match).
+        let first = session
+            .matches()
+            .iter()
+            .position(|range| range.start >= caret)
+            .unwrap_or(0);
+        for _ in 0..=first {
+            session.next_match();
+        }
+        let count = session.matches().len();
+        self.search = Some(session);
+        self.show_current_match(cx);
+        count
+    }
+
+    /// Selects the next match (wrapping). Returns its index and the match
+    /// count, or `None` without matches.
+    pub fn find_next(&mut self, cx: &mut Context<Self>) -> Option<(usize, usize)> {
+        self.step_match(true, cx)
+    }
+
+    /// Selects the previous match (wrapping).
+    pub fn find_previous(&mut self, cx: &mut Context<Self>) -> Option<(usize, usize)> {
+        self.step_match(false, cx)
+    }
+
+    /// The current match's index (if one is selected) and the match count.
+    pub fn find_status(&self) -> Option<(Option<usize>, usize)> {
+        self.search
+            .as_ref()
+            .map(|search| (search.current_match_index(), search.matches().len()))
+    }
+
+    /// Replaces the current match (or the first) with `replacement` and
+    /// selects the next one. Returns whether anything was replaced.
+    pub fn replace_current(&mut self, replacement: &str, cx: &mut Context<Self>) -> bool {
+        if self.read_only {
+            return false;
+        }
+        self.sync_search();
+        let Some(search) = self.search.as_ref() else {
+            return false;
+        };
+        let Some(range) = search
+            .current_match()
+            .or_else(|| search.matches().first())
+            .cloned()
+        else {
+            return false;
+        };
+        let transaction =
+            Transaction::from_edits([Edit::replace(range.clone(), replacement.to_owned())]);
+        let Ok(applied) = self
+            .surface
+            .apply_transaction(&transaction, Grouping::Separate)
+        else {
+            return false;
+        };
+        let after = applied.change_map.map_offset(range.end, Affinity::After);
+        self.surface
+            .editor_mut()
+            .set_selections(SelectionSet::caret(after));
+        // The next match is the first one at or after the replacement.
+        self.rebuild_search_from(after);
+        self.show_current_match(cx);
+        cx.emit(EditorEvent::Changed);
+        true
+    }
+
+    /// Replaces every match with `replacement` in one undo step. Returns the
+    /// number replaced.
+    pub fn replace_all(&mut self, replacement: &str, cx: &mut Context<Self>) -> usize {
+        if self.read_only {
+            return 0;
+        }
+        self.sync_search();
+        let Some(search) = self.search.as_ref() else {
+            return 0;
+        };
+        let ranges = search.matches().to_vec();
+        if ranges.is_empty() {
+            return 0;
+        }
+        let transaction = Transaction::from_edits(
+            ranges
+                .iter()
+                .map(|range| Edit::replace(range.clone(), replacement.to_owned())),
+        );
+        let selections = self.surface.editor().selections().clone();
+        let Ok(applied) = self
+            .surface
+            .apply_transaction(&transaction, Grouping::Separate)
+        else {
+            return 0;
+        };
+        self.surface
+            .editor_mut()
+            .set_selections(selections.map(&applied.change_map));
+        self.rebuild_search_from(usize::MAX);
+        let search = self.search.as_ref();
+        self.surface.set_search(search);
+        cx.emit(EditorEvent::Changed);
+        cx.notify();
+        ranges.len()
+    }
+
+    /// Ends the search and removes its highlights.
+    pub fn clear_find(&mut self, cx: &mut Context<Self>) {
+        if self.search.take().is_some() {
+            self.surface.set_search(None);
+            cx.notify();
+        }
+    }
+
+    fn step_match(&mut self, forward: bool, cx: &mut Context<Self>) -> Option<(usize, usize)> {
+        self.sync_search();
+        let search = self.search.as_mut()?;
+        let found = if forward {
+            search.next_match().is_some()
+        } else {
+            search.previous_match().is_some()
+        };
+        if !found {
+            return None;
+        }
+        self.show_current_match(cx);
+        let search = self.search.as_ref()?;
+        Some((search.current_match_index()?, search.matches().len()))
+    }
+
+    /// Re-runs the search against the current text when the document moved
+    /// on since it was made, keeping the current match by position.
+    fn sync_search(&mut self) {
+        let version = self.surface.editor().snapshot().version();
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+        if search.document_version() == version {
+            return;
+        }
+        let previous = search
+            .current_match()
+            .map_or(usize::MAX, |range| range.start);
+        self.rebuild_search_from(previous);
+        let search = self.search.as_ref();
+        self.surface.set_search(search);
+    }
+
+    /// Re-runs the search on the current text, with the first match at or
+    /// after `from` current (none for `usize::MAX`).
+    fn rebuild_search_from(&mut self, from: usize) {
+        let Some(query) = self.search.as_ref().map(|search| search.query().clone()) else {
+            return;
+        };
+        let snapshot = self.surface.editor().snapshot();
+        let mut session = SearchSession::new(&snapshot, query);
+        if let Some(index) = session
+            .matches()
+            .iter()
+            .position(|range| range.start >= from)
+        {
+            for _ in 0..=index {
+                session.next_match();
+            }
+        }
+        self.search = Some(session);
+    }
+
+    /// Selects and reveals the current match, and repaints the highlights.
+    fn show_current_match(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+        if let Some(range) = search.current_match().cloned() {
+            self.surface
+                .editor_mut()
+                .set_selections(SelectionSet::new([Selection::range(
+                    range.start,
+                    range.end,
+                )]));
+            self.center_on(range.start);
+        }
+        let search = self.search.as_ref();
+        self.surface.set_search(search);
+        cx.notify();
     }
 
     // ---- per-frame preparation -------------------------------------------
@@ -560,6 +802,7 @@ impl WgpuiEditorView {
         match self.input_router.route(&mut self.surface, event) {
             Ok(outcome) => {
                 if outcome.document_changed {
+                    self.sync_search();
                     cx.emit(EditorEvent::Changed);
                 } else if outcome.selection_changed {
                     // Moving the caret ends hover and completion.
@@ -595,6 +838,7 @@ impl WgpuiEditorView {
             self.close_completion(cx);
             self.surface.reveal_primary_caret();
             self.retarget_from_surface();
+            self.sync_search();
             cx.emit(EditorEvent::Changed);
             cx.notify();
         }

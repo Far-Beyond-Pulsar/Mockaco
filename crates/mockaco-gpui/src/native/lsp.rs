@@ -339,6 +339,17 @@ impl WgpuiEditorView {
         }
     }
 
+    /// A position request at the primary caret, for a host that asks its
+    /// language server something the view has no event for (references,
+    /// symbols). `None` without language intelligence or with a selection.
+    pub fn lsp_request_at_caret(&mut self) -> Option<LspRequest> {
+        if !self.intel.enabled {
+            return None;
+        }
+        let caret = self.primary_caret()?;
+        self.lsp_request(caret)
+    }
+
     // ---- shared helpers ---------------------------------------------------
 
     fn primary_caret(&self) -> Option<usize> {
