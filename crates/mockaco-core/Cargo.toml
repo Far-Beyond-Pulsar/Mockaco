@@ -14,3 +14,5 @@ path = "src/lib.rs"
 # Only LF is a line break, matching Mockaco's line model (CR before LF is part
 # of the line ending, a lone CR is ordinary text).
 ropey = { version = "1.6", default-features = false, features = ["simd"] }
+# Regular-expression search (`SearchQuery::regex`).
+regex = "1"

@@ -406,21 +406,52 @@ impl WgpuiEditorView {
         );
     }
 
+    /// Ctrl+D: selects the word under the caret, or adds the next
+    /// occurrence of the selected text as another selection (see
+    /// [`mockaco_core::add_next_occurrence`]) and reveals it. Returns
+    /// whether the selections changed.
+    pub fn add_next_occurrence(&mut self, cx: &mut Context<Self>) -> bool {
+        let editor = self.surface.editor();
+        let Some(next) =
+            mockaco_core::add_next_occurrence(editor.snapshot().text(), editor.selections())
+        else {
+            return false;
+        };
+        let added = next
+            .selections()
+            .iter()
+            .find(|selection| !editor.selections().selections().contains(selection))
+            .copied();
+        self.surface.editor_mut().set_selections(next);
+        if let Some(added) = added {
+            self.surface.reveal_byte(added.head);
+        }
+        cx.notify();
+        true
+    }
+
     // ---- find / replace ---------------------------------------------------
 
     /// Searches for `pattern`, highlights every match and selects the first
     /// one at or after the caret. An empty pattern clears the search.
     /// Returns the number of matches.
     pub fn find(&mut self, pattern: &str, case_sensitive: bool, cx: &mut Context<Self>) -> usize {
-        if pattern.is_empty() {
-            self.clear_find(cx);
-            return 0;
-        }
         let query = SearchQuery::new(pattern).case_sensitivity(if case_sensitive {
             CaseSensitivity::Sensitive
         } else {
             CaseSensitivity::Insensitive
         });
+        self.find_query(query, cx)
+    }
+
+    /// [`find`](Self::find) with every option of `query` (whole word,
+    /// regular expression). A regular expression that does not compile
+    /// matches nothing; [`SearchQuery::error`] says why.
+    pub fn find_query(&mut self, query: SearchQuery, cx: &mut Context<Self>) -> usize {
+        if query.pattern.is_empty() {
+            self.clear_find(cx);
+            return 0;
+        }
         let snapshot = self.surface.editor().snapshot();
         let mut session = SearchSession::new(&snapshot, query);
         let caret = self
@@ -480,8 +511,11 @@ impl WgpuiEditorView {
         else {
             return false;
         };
-        let transaction =
-            Transaction::from_edits([Edit::replace(range.clone(), replacement.to_owned())]);
+        let text = self.surface.editor().snapshot().text().to_string();
+        let replacement = search
+            .query()
+            .expand_replacement(&text, range.clone(), replacement);
+        let transaction = Transaction::from_edits([Edit::replace(range.clone(), replacement)]);
         let Ok(applied) = self
             .surface
             .apply_transaction(&transaction, Grouping::Separate)
@@ -513,11 +547,14 @@ impl WgpuiEditorView {
         if ranges.is_empty() {
             return 0;
         }
-        let transaction = Transaction::from_edits(
-            ranges
-                .iter()
-                .map(|range| Edit::replace(range.clone(), replacement.to_owned())),
-        );
+        let text = self.surface.editor().snapshot().text().to_string();
+        let query = search.query().clone();
+        let transaction = Transaction::from_edits(ranges.iter().map(|range| {
+            Edit::replace(
+                range.clone(),
+                query.expand_replacement(&text, range.clone(), replacement),
+            )
+        }));
         let selections = self.surface.editor().selections().clone();
         let Ok(applied) = self
             .surface
