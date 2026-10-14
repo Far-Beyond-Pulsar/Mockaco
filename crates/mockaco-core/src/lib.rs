@@ -28,7 +28,9 @@ pub use position_map::{
     ByteOffset, ColumnEncoding, LineColumn, Position, PositionError, PositionMap, TextPosition,
     Utf16Offset,
 };
-pub use search::{CaseSensitivity, ReplaceResult, SearchError, SearchQuery, SearchSession};
+pub use search::{
+    add_next_occurrence, CaseSensitivity, ReplaceResult, SearchError, SearchQuery, SearchSession,
+};
 pub use selection::{Selection, SelectionSet};
 pub use text::{ByteChunks, CharIndices, Text};
 pub use transaction::{

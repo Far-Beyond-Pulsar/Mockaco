@@ -177,3 +177,69 @@ fn add_cursor_adds_a_caret_below_and_above() {
     });
     assert_eq!(carets.len(), 3, "{carets:?}");
 }
+
+#[test]
+fn find_query_takes_whole_word_and_regex_and_replaces_groups() {
+    use mockaco_core::SearchQuery;
+    let mut cx = TestAppContext::single();
+    let (view, cx) = view_with(&mut cx, "let a1 = b2;\nlet ab = a1;\n");
+
+    let whole = view.update(cx, |view, cx| {
+        view.find_query(SearchQuery::new("a1").whole_word(true), cx)
+    });
+    assert_eq!(whole, 2);
+    let regex = view.update(cx, |view, cx| {
+        view.find_query(SearchQuery::new(r"([a-z])(\d)").regex(true), cx)
+    });
+    assert_eq!(regex, 3, "a1, b2 and a1");
+    let replaced = view.update(cx, |view, cx| view.replace_all("$2$1", cx));
+    assert_eq!(replaced, 3);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.text()),
+        "let 1a = 2b;\nlet ab = 1a;\n"
+    );
+
+    // An invalid expression matches nothing and clears the highlights.
+    let invalid = view.update(cx, |view, cx| {
+        view.find_query(SearchQuery::new("(").regex(true), cx)
+    });
+    assert_eq!(invalid, 0);
+    assert_eq!(highlights(&view, cx), (0, 0));
+}
+
+#[test]
+fn add_next_occurrence_grows_the_selection_set() {
+    let mut cx = TestAppContext::single();
+    let (view, cx) = view_with(&mut cx, "foo + foo + bar + foo\n");
+    let count = |view: &wgpui::Entity<WgpuiEditorView>, cx: &mut wgpui::VisualTestContext| {
+        view.read_with(cx, |view, _| view.surface.editor().selections().len())
+    };
+
+    assert!(view.update(cx, |view, cx| view.add_next_occurrence(cx)));
+    assert_eq!(selection(&view, cx), 0..3, "the word under the caret");
+    assert_eq!(count(&view, cx), 1);
+    assert!(view.update(cx, |view, cx| view.add_next_occurrence(cx)));
+    assert!(view.update(cx, |view, cx| view.add_next_occurrence(cx)));
+    assert_eq!(count(&view, cx), 3);
+    assert_eq!(
+        selection(&view, cx),
+        18..21,
+        "the last one added is primary"
+    );
+    assert!(
+        !view.update(cx, |view, cx| view.add_next_occurrence(cx)),
+        "no occurrence left"
+    );
+
+    // Typing replaces every occurrence at once.
+    cx.update(|window, app| {
+        let handle = wgpui::Focusable::focus_handle(view.read(app), app);
+        window.focus(&handle, app);
+    });
+    cx.simulate_input("q");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, _| view.text()),
+        "q + q + bar + q\n"
+    );
+}
