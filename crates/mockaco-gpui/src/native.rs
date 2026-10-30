@@ -269,14 +269,15 @@ impl WgpuiEditorView {
 
     // ---- inline blocks -----------------------------------------------
 
-    /// Shows `view` in `rows` display rows reserved below buffer line
-    /// `after_line`, replacing any block with the same `id`. The view is
+    /// Shows `view` in `rows` display rows reserved above or below buffer line
+    /// `line`, replacing any block with the same `id`. The view is
     /// clipped to the code area and stays attached to its line through edits.
     /// Call again with a new `rows` to resize it (a streaming answer growing).
     pub fn set_block(
         &mut self,
         id: u64,
-        after_line: usize,
+        line: usize,
+        placement: mockaco_renderer::BlockPlacement,
         rows: u32,
         view: AnyView,
         cx: &mut Context<Self>,
@@ -288,7 +289,7 @@ impl WgpuiEditorView {
             .copied()
             .filter(|block| block.id != id)
             .collect();
-        blocks.push(mockaco_renderer::Block { id, after_line, rows });
+        blocks.push(mockaco_renderer::Block { id, line, placement, rows });
         self.surface.set_blocks(blocks);
         self.block_views.insert(id, view);
         cx.notify();
@@ -322,7 +323,7 @@ impl WgpuiEditorView {
             .blocks()
             .iter()
             .find(|block| block.id == id)
-            .map(|block| block.after_line)
+            .map(|block| block.line)
     }
 
     /// The block views that intersect the viewport, placed over their
@@ -1448,7 +1449,7 @@ impl WgpuiEditorView {
             (region.start_line, region.end_line).hash(&mut folds);
         }
         for block in self.surface.display().blocks() {
-            (block.id, block.after_line, block.rows).hash(&mut folds);
+            (block.id, block.line, block.rows).hash(&mut folds);
         }
         (
             self.surface.document().version(),

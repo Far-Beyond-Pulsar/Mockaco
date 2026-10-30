@@ -21,7 +21,7 @@ use mockaco_renderer::{
     diagnostic_decorations, search_decorations, Decoration, DisplayMap, DisplayMapError,
     DIAGNOSTIC_ERROR_STYLE_ID, DIAGNOSTIC_HINT_STYLE_ID, DIAGNOSTIC_INFO_STYLE_ID,
     DIAGNOSTIC_WARNING_STYLE_ID, SEARCH_CURRENT_MATCH_STYLE_ID, SEARCH_MATCH_STYLE_ID,
-    Block, BlockRow, DisplayPoint, DisplayViewport, GutterLayout, ProjectedDecoration,
+    Block, BlockPlacement, BlockRow, DisplayPoint, DisplayViewport, GutterLayout, ProjectedDecoration,
 };
 use std::fmt;
 use std::ops::Range;
@@ -3856,7 +3856,7 @@ mod tests {
     #[test]
     fn blocks_reserve_rows_and_carets_step_over_them() {
         let mut surface = surface("one\ntwo\nthree");
-        surface.set_blocks([Block { id: 9, after_line: 0, rows: 2 }]);
+        surface.set_blocks([Block { id: 9, line: 0, placement: mockaco_renderer::BlockPlacement::Below, rows: 2 }]);
         let (top, height) = surface.block_rect(9).expect("block is laid out");
         assert_eq!(top, surface.geometry().line_height);
         assert_eq!(height, 2.0 * surface.geometry().line_height);
