@@ -20,6 +20,8 @@ use crate::{
     CODE_PADDING, GUTTER_FOLD_WIDTH, GUTTER_MARKER_WIDTH,
 };
 mod lsp;
+mod review;
+pub use review::REVIEW_BLOCK_BASE;
 use self::lsp::{EditKind, Intel};
 use mockaco_core::{
     Affinity, CaseSensitivity, Edit, Grouping, SearchQuery, SearchSession, Selection, SelectionSet,
@@ -34,7 +36,7 @@ use std::rc::Rc;
 use std::time::Instant;
 use wgpui::{
     div, fill, font, point, px, size,
-    App, Bounds, ClipboardItem, ContentMask, Context, Corners,
+    AnyElement, AnyView, App, Bounds, ClipboardItem, ContentMask, Context, Corners,
     CursorStyle, DispatchPhase, Element, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
     Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, GlobalElementId, Hitbox,
     HitboxBehavior, Hsla, InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent,
@@ -76,6 +78,18 @@ pub enum EditorEvent {
     /// The selected completion has no documentation yet: answer with
     /// [`WgpuiEditorView::resolve_completion`].
     CompletionResolveRequested { request: u64, host_data: u64 },
+    /// The primary selection (or caret) moved or the text under it changed.
+    /// Not sent while a mouse drag is in progress; the drag's end sends it.
+    SelectionChanged,
+    /// Ctrl/Cmd+I: the user wants to talk to an assistant about the
+    /// selection or caret.
+    InlineAssistRequested,
+    /// Ctrl/Cmd+.: the user wants fixes and refactorings for the caret.
+    QuickFixRequested,
+    /// An inline review has hunks left; `pending` is how many.
+    ReviewUpdated { pending: usize },
+    /// The review is closed: every hunk was accepted or rejected.
+    ReviewFinished { accepted: usize, rejected: usize },
     /// A completion tagged with `host_data` was accepted. Hosts that resolve
     /// lazily fetch its extra edits and answer with
     /// [`WgpuiEditorView::apply_position_edits`].
@@ -152,6 +166,12 @@ pub struct WgpuiEditorView {
     hover: Region,
     show_minimap: bool,
     line_backgrounds: HashMap<usize, SurfaceColor>,
+    /// Host views shown in reserved block rows, by block id.
+    block_views: HashMap<u64, AnyView>,
+    review: Option<review::ReviewState>,
+    last_selection: Option<(usize, usize)>,
+    /// Added-line tints of an open review, drawn under host line backgrounds.
+    review_backgrounds: HashMap<usize, SurfaceColor>,
     /// Show fold chevrons on every foldable line (true) or only while the
     /// pointer is over the gutter (false).
     always_show_fold_controls: bool,
@@ -199,6 +219,10 @@ impl WgpuiEditorView {
             hover: Region::None,
             show_minimap: true,
             line_backgrounds: HashMap::new(),
+            block_views: HashMap::new(),
+            review: None,
+            last_selection: None,
+            review_backgrounds: HashMap::new(),
             always_show_fold_controls: true,
             minimap_buffer: None,
             intel: Intel::default(),
@@ -262,6 +286,138 @@ impl WgpuiEditorView {
     ) {
         self.line_backgrounds = backgrounds;
         cx.notify();
+    }
+
+    // ---- selection ------------------------------------------------------
+
+    /// The primary selection as a byte range (empty for a caret).
+    pub fn selection_range(&self) -> std::ops::Range<usize> {
+        self.surface
+            .editor()
+            .selections()
+            .primary()
+            .map_or(0..0, |selection| selection.ordered_range())
+    }
+
+    /// The text of the primary selection (empty for a caret).
+    pub fn selected_text(&self) -> String {
+        let range = self.selection_range();
+        self.surface
+            .document()
+            .text()
+            .slice(range)
+            .into_owned()
+    }
+
+    /// Window-space `(left, line top, line bottom)` of `byte`, or `None` when
+    /// it is scrolled out of view or the view has not been painted. For
+    /// anchoring a host's popups to the text.
+    pub fn byte_window_rect(&self, byte: usize) -> Option<(f32, f32, f32)> {
+        self.overlay_position(byte)
+    }
+
+    fn emit_selection_changed(&mut self, cx: &mut Context<Self>) {
+        let range = self.selection_range();
+        let key = (range.start, range.end);
+        if self.last_selection != Some(key) {
+            self.last_selection = Some(key);
+            cx.emit(EditorEvent::SelectionChanged);
+        }
+    }
+
+    // ---- inline blocks -----------------------------------------------
+
+    /// Shows `view` in `rows` display rows reserved above or below buffer line
+    /// `line`, replacing any block with the same `id`. The view is
+    /// clipped to the code area and stays attached to its line through edits.
+    /// Call again with a new `rows` to resize it (a streaming answer growing).
+    pub fn set_block(
+        &mut self,
+        id: u64,
+        line: usize,
+        placement: mockaco_renderer::BlockPlacement,
+        rows: u32,
+        view: AnyView,
+        cx: &mut Context<Self>,
+    ) {
+        let mut blocks: Vec<mockaco_renderer::Block> = self
+            .surface
+            .blocks()
+            .iter()
+            .copied()
+            .filter(|block| block.id != id)
+            .collect();
+        blocks.push(mockaco_renderer::Block { id, line, placement, rows });
+        self.surface.set_blocks(blocks);
+        self.block_views.insert(id, view);
+        cx.notify();
+    }
+
+    /// Removes block `id` and gives its rows back.
+    pub fn remove_block(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.block_views.remove(&id).is_none() {
+            return;
+        }
+        let blocks: Vec<mockaco_renderer::Block> = self
+            .surface
+            .blocks()
+            .iter()
+            .copied()
+            .filter(|block| block.id != id)
+            .collect();
+        self.surface.set_blocks(blocks);
+        cx.notify();
+    }
+
+    pub fn clear_blocks(&mut self, cx: &mut Context<Self>) {
+        self.block_views.clear();
+        self.surface.set_blocks([]);
+        cx.notify();
+    }
+
+    /// The buffer line block `id` currently hangs below (it moves with edits).
+    pub fn block_line(&self, id: u64) -> Option<usize> {
+        self.surface
+            .blocks()
+            .iter()
+            .find(|block| block.id == id)
+            .map(|block| block.line)
+    }
+
+    /// The block views that intersect the viewport, placed over their
+    /// reserved rows.
+    fn render_blocks(&self) -> Option<AnyElement> {
+        if self.block_views.is_empty() {
+            return None;
+        }
+        let (_, rem_y) = self.remainders();
+        let width = (self.layout.code_right - self.layout.text_left).max(0.0);
+        let viewport = self.layout.viewport_height;
+        let children = self.block_views.iter().filter_map(|(id, view)| {
+            let (top, height) = self.surface.block_rect(*id)?;
+            let top = top - rem_y;
+            (top + height > 0.0 && top < viewport).then(|| {
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(top))
+                    .w(px(width))
+                    .h(px(height))
+                    .overflow_hidden()
+                    .child(view.clone())
+            })
+        });
+        Some(
+            div()
+                .absolute()
+                .left(px(self.layout.text_left))
+                .top(px(0.0))
+                .w(px(width))
+                .h(px(viewport))
+                .overflow_hidden()
+                .children(children)
+                .into_any_element(),
+        )
     }
 
     /// Replaces the whole document (file loads, external changes).
@@ -849,6 +1005,9 @@ impl WgpuiEditorView {
                 if outcome.document_changed {
                     self.after_edit(edit_kind, cx);
                 }
+                if (outcome.selection_changed || outcome.document_changed) && self.drag != Drag::Text {
+                    self.emit_selection_changed(cx);
+                }
                 // Only keyboard navigation retargets scrolling; a mouse click
                 // never shifts the view (the paint-time sync restores it).
                 if outcome.scroll_changed && !is_scroll && keyboard {
@@ -881,7 +1040,12 @@ impl WgpuiEditorView {
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A view hosted in a block (an inline prompt) has its own focus; its
+        // keystrokes bubble through here and must not edit the document.
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
         let keystroke = &event.keystroke;
         let modifiers = KeyModifiers {
             shift: keystroke.modifiers.shift,
@@ -890,6 +1054,10 @@ impl WgpuiEditorView {
             command: keystroke.modifiers.platform,
         };
         let primary = modifiers.control || modifiers.command;
+        if self.review_key(keystroke.key.as_str(), primary, modifiers.alt, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if self.intel.enabled {
             let name = keystroke.key.as_str();
             let is_modifier = matches!(
@@ -923,6 +1091,16 @@ impl WgpuiEditorView {
         }
         if primary && !modifiers.alt {
             match keystroke.key.as_str() {
+                "i" => {
+                    cx.emit(EditorEvent::InlineAssistRequested);
+                    cx.stop_propagation();
+                    return;
+                }
+                "." => {
+                    cx.emit(EditorEvent::QuickFixRequested);
+                    cx.stop_propagation();
+                    return;
+                }
                 "s" => {
                     cx.emit(EditorEvent::SaveRequested);
                     cx.stop_propagation();
@@ -1110,8 +1288,26 @@ impl WgpuiEditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle, cx);
         let region = self.region_at(x, y);
+        // Reserved block rows belong to the host's own UI: a click there must
+        // neither move the caret nor take focus from the view in the block.
+        if matches!(region, Region::Gutter | Region::Text) && y < self.layout.viewport_height {
+            let (_, rem_y) = self.remainders();
+            let row = self
+                .surface
+                .scroll()
+                .top_row
+                .saturating_add(((y + rem_y) / self.line_height).floor() as usize);
+            if self
+                .surface
+                .display()
+                .row(row)
+                .is_some_and(|row| row.block.is_some())
+            {
+                return;
+            }
+        }
+        window.focus(&self.focus_handle, cx);
         self.dismiss_hover(cx);
         self.close_completion(cx);
         match region {
@@ -1289,6 +1485,7 @@ impl WgpuiEditorView {
                 }),
                 cx,
             );
+            self.emit_selection_changed(cx);
         }
         if was != Drag::None {
             cx.notify();
@@ -1330,6 +1527,9 @@ impl WgpuiEditorView {
         let mut folds = std::collections::hash_map::DefaultHasher::new();
         for region in self.surface.display().folds().regions() {
             (region.start_line, region.end_line).hash(&mut folds);
+        }
+        for block in self.surface.display().blocks() {
+            (block.id, block.line, block.rows).hash(&mut folds);
         }
         (
             self.surface.document().version(),
@@ -1374,7 +1574,15 @@ impl WgpuiEditorView {
         let backgrounds = frame
             .rows
             .iter()
-            .map(|row| self.line_backgrounds.get(&row.buffer_line).copied())
+            .map(|row| {
+                if row.block.is_some() {
+                    return None;
+                }
+                self.line_backgrounds
+                    .get(&row.buffer_line)
+                    .or_else(|| self.review_backgrounds.get(&row.buffer_line))
+                    .copied()
+            })
             .collect();
         PaintData {
             layout: self.layout,
@@ -1442,6 +1650,7 @@ impl Render for WgpuiEditorView {
             .child(EditorElement {
                 editor: cx.entity(),
             })
+            .children(self.render_blocks())
             .children(overlays)
     }
 }

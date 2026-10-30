@@ -207,6 +207,44 @@ pub struct DisplayRow {
     pub folded: bool,
     pub truncated: bool,
     pub display_width: usize,
+    /// `Some` when this row is reserved space for a [`Block`] rather than text.
+    /// Such a row has an empty byte range at the end of `buffer_line`, is a
+    /// `continuation`, and is never `folded`.
+    pub block: Option<BlockRow>,
+}
+
+/// Which side of its line a [`Block`] hangs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlockPlacement {
+    /// Between the previous line and this one (needed for a change at the
+    /// very top of a file).
+    Above,
+    /// After the line and all its wrap rows.
+    #[default]
+    Below,
+}
+
+/// A host-owned region of reserved display rows next to a buffer line (an
+/// inline chat box, a diff hunk, a peek view). The map only reserves the
+/// rows; the host paints whatever it likes over them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Block {
+    /// Host-chosen identity, stable across `set_blocks` calls.
+    pub id: u64,
+    /// The buffer line the block is attached to.
+    pub line: usize,
+    pub placement: BlockPlacement,
+    /// How many display rows to reserve. Zero is ignored.
+    pub rows: u32,
+}
+
+/// Which block a reserved row belongs to, and where in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockRow {
+    pub id: u64,
+    /// Row within the block, `0..rows`.
+    pub index: u32,
+    pub rows: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,6 +431,9 @@ pub struct DisplayMap {
     /// `hidden_starts[k]`: the visible row index where `hidden[k]` begins,
     /// which is the row its first line would take if it were shown.
     hidden_starts: Vec<usize>,
+    /// Reserved block rows, sorted by `(line, id)`. Their rows are part
+    /// of each line's entry in `index`.
+    blocks: Vec<Block>,
     revision: u64,
     last_update: Option<DisplayUpdate>,
 }
@@ -417,6 +458,7 @@ impl DisplayMap {
             hidden: Vec::new(),
             hidden_rows: vec![0],
             hidden_starts: Vec::new(),
+            blocks: Vec::new(),
             revision: 0,
             last_update: None,
         };
@@ -490,16 +532,29 @@ impl DisplayMap {
         let absolute = row + self.hidden_rows[hidden_before];
         let (line, segment) = self.index.row_to_line(absolute)?;
         let segments = self.segments(line);
-        let segment_index = segment.min(segments.len().saturating_sub(1));
-        let segment = segments.get(segment_index)?;
+        self.row_in_line(line, segment, &segments)
+    }
+
+    /// The `offset`th display row of `line`, counting its blocks above, its
+    /// text rows (`segments`), then its blocks below.
+    fn row_in_line(&self, line: usize, offset: usize, segments: &[Segment]) -> Option<DisplayRow> {
+        let (above, _) = self.block_split(line);
+        if offset < above as usize {
+            return self.block_row(line, BlockPlacement::Above, offset, segments);
+        }
+        let text = offset - above as usize;
+        let Some(segment) = segments.get(text) else {
+            return self.block_row(line, BlockPlacement::Below, text - segments.len(), segments);
+        };
         Some(DisplayRow {
             buffer_line: line,
             start_byte: segment.start,
             end_byte: segment.end,
-            continuation: segment_index > 0,
+            continuation: text > 0,
             folded: self.folds.region_starting_at(line).is_some(),
             truncated: segment.truncated,
             display_width: segment.width,
+            block: None,
         })
     }
 
@@ -522,7 +577,8 @@ impl DisplayMap {
         };
         let mut segments = self.segments(line);
         while rows.len() < end - start {
-            if segment >= segments.len() {
+            if segment >= segments.len() + self.block_rows(line) as usize {
+                // Past this line's last row: on to the next shown line.
                 line += 1;
                 if let Some(hidden) = self.hidden_range(line) {
                     line = hidden.end;
@@ -537,16 +593,9 @@ impl DisplayMap {
                 }
                 continue;
             }
-            let current = &segments[segment];
-            rows.push(DisplayRow {
-                buffer_line: line,
-                start_byte: current.start,
-                end_byte: current.end,
-                continuation: segment > 0,
-                folded: self.folds.region_starting_at(line).is_some(),
-                truncated: current.truncated,
-                display_width: current.width,
-            });
+            if let Some(row) = self.row_in_line(line, segment, &segments) {
+                rows.push(row);
+            }
             segment += 1;
         }
         rows
@@ -556,9 +605,14 @@ impl DisplayMap {
         self.rows_in(viewport.rows(self.row_count()))
     }
 
-    /// The visible row a shown `line` starts at, or `None` when a fold hides
-    /// it.
+    /// The visible row a shown `line`'s text starts at, or `None` when a fold
+    /// hides it.
     pub fn line_to_row(&self, line: usize) -> Option<usize> {
+        Some(self.line_first_row(line)? + self.block_split(line).0 as usize)
+    }
+
+    /// The first visible row of `line` including blocks above it.
+    fn line_first_row(&self, line: usize) -> Option<usize> {
         let interval = self.hidden.partition_point(|hidden| hidden.end <= line);
         if self
             .hidden
@@ -622,11 +676,14 @@ impl DisplayMap {
         let new_first_line = new_text.byte_to_line(new_range.start)?;
         let new_last_line = new_text.byte_to_line(new_range.end)?;
 
+        self.remap_blocks(snapshot, &transaction.change_map);
         let infos = (new_first_line..=new_last_line)
             .map(|line| {
-                new_text
-                    .line(line)
-                    .map(|text| line_info(&text, &self.config))
+                new_text.line(line).map(|text| {
+                    let mut info = line_info(&text, &self.config);
+                    info.rows += self.block_rows(line);
+                    info
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let recomputed_rows = infos.iter().map(|info| info.rows as usize).sum();
@@ -782,6 +839,9 @@ impl DisplayMap {
         let text = self.snapshot.text();
         for (offset, row) in rows.iter().enumerate() {
             let display_row = start_row + offset;
+            if row.block.is_some() {
+                continue;
+            }
             for decoration in &decorations[first_decoration..] {
                 if decoration.range.start > byte_end {
                     break;
@@ -829,6 +889,161 @@ impl DisplayMap {
             self.config.max_line_scan_bytes,
             self.config.tab_width,
         )
+    }
+
+    /// The blocks currently reserving rows.
+    pub fn blocks(&self) -> &[Block] {
+        &self.blocks
+    }
+
+    /// The blocks attached to `line`.
+    fn line_blocks(&self, line: usize) -> impl Iterator<Item = &Block> {
+        let start = self.blocks.partition_point(|block| block.line < line);
+        self.blocks[start..]
+            .iter()
+            .take_while(move |block| block.line == line)
+    }
+
+    /// Rows reserved on both sides of `line`.
+    fn block_rows(&self, line: usize) -> u32 {
+        self.line_blocks(line).map(|block| block.rows).sum()
+    }
+
+    /// Rows reserved `(above, below)` `line`.
+    fn block_split(&self, line: usize) -> (u32, u32) {
+        self.line_blocks(line).fold((0, 0), |(above, below), block| match block.placement {
+            BlockPlacement::Above => (above + block.rows, below),
+            BlockPlacement::Below => (above, below + block.rows),
+        })
+    }
+
+    /// The `offset`th reserved row on one side of `line`; `segments` are the
+    /// line's text rows. `None` when `offset` is past that side's blocks.
+    fn block_row(
+        &self,
+        line: usize,
+        placement: BlockPlacement,
+        offset: usize,
+        segments: &[Segment],
+    ) -> Option<DisplayRow> {
+        let mut remaining = offset;
+        for block in self
+            .line_blocks(line)
+            .filter(|block| block.placement == placement)
+        {
+            if remaining < block.rows as usize {
+                // Above rows hold the line's start, below rows its end, so a
+                // caret clamped onto one stays beside the line it hangs on.
+                let end = match placement {
+                    BlockPlacement::Above => segments.first().map_or(0, |segment| segment.start),
+                    BlockPlacement::Below => segments.last().map_or(0, |segment| segment.end),
+                };
+                return Some(DisplayRow {
+                    buffer_line: line,
+                    start_byte: end,
+                    end_byte: end,
+                    continuation: true,
+                    folded: false,
+                    truncated: false,
+                    display_width: 0,
+                    block: Some(BlockRow {
+                        id: block.id,
+                        index: remaining as u32,
+                        rows: block.rows,
+                    }),
+                });
+            }
+            remaining -= block.rows as usize;
+        }
+        None
+    }
+
+    /// The first display row of block `id`, or `None` when it does not exist
+    /// or a fold hides its line.
+    pub fn block_to_row(&self, id: u64) -> Option<usize> {
+        let block = self.blocks.iter().find(|block| block.id == id)?;
+        let first = self.line_first_row(block.line)?;
+        let (above, _) = self.block_split(block.line);
+        let mut row = match block.placement {
+            BlockPlacement::Above => first,
+            BlockPlacement::Below => first + above as usize + self.segments(block.line).len(),
+        };
+        for earlier in self
+            .line_blocks(block.line)
+            .filter(|other| other.placement == block.placement)
+            .take_while(|other| other.id != id)
+        {
+            row += earlier.rows as usize;
+        }
+        Some(row)
+    }
+
+    /// Replaces all blocks. Only the lines whose reservation changed are
+    /// relaid out. Lines past the document are clamped to the last line.
+    pub fn set_blocks(&mut self, blocks: impl IntoIterator<Item = Block>) {
+        let last = self.index.line_count().saturating_sub(1);
+        let mut next: Vec<Block> = blocks
+            .into_iter()
+            .filter(|block| block.rows > 0)
+            .map(|block| Block {
+                line: block.line.min(last),
+                ..block
+            })
+            .collect();
+        next.sort_by_key(|block| (block.line, block.id));
+        if next == self.blocks {
+            return;
+        }
+        let mut lines: Vec<usize> = self
+            .blocks
+            .iter()
+            .chain(next.iter())
+            .map(|block| block.line)
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        let old_extra: Vec<u32> = lines.iter().map(|&line| self.block_rows(line)).collect();
+        self.blocks = next;
+        for (&line, old) in lines.iter().zip(old_extra) {
+            let new = self.block_rows(line);
+            if new == old {
+                continue;
+            }
+            if let Some(info) = self.index.get(line) {
+                let info = LineInfo {
+                    rows: info.rows - old + new,
+                    ..info
+                };
+                self.index.splice(line..line + 1, vec![info]);
+            }
+        }
+        self.refresh_hidden();
+        self.revision = self.revision.saturating_add(1);
+        self.last_update = None;
+    }
+
+    /// Keeps blocks attached to their text across an edit: each block's line
+    /// start is carried through the edit's change map, so a block follows its
+    /// line when lines are inserted above it or the lines around it are
+    /// replaced by a different number of lines.
+    fn remap_blocks(&mut self, new_snapshot: &DocumentSnapshot, changes: &mockaco_core::ChangeMap) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        let old_map = self.snapshot.position_map();
+        let new_map = new_snapshot.position_map();
+        let last = new_map.line_count().saturating_sub(1);
+        for block in &mut self.blocks {
+            let Ok(start) = old_map.line_start(block.line) else {
+                block.line = block.line.min(last);
+                continue;
+            };
+            let mapped = changes.map_offset(start, Affinity::After);
+            block.line = new_map
+                .byte_to_line(mapped)
+                .map_or(last, |line| line.min(last));
+        }
+        self.blocks.sort_by_key(|block| (block.line, block.id));
     }
 
     /// Rebuilds the hidden ranges and their row prefixes from the active
@@ -1266,5 +1481,103 @@ mod tests {
             Err(DisplayMapError::SnapshotVersion { .. })
         ));
         let _ = newer;
+    }
+
+    fn block(id: u64, line: usize, rows: u32) -> Block {
+        Block { id, line, placement: BlockPlacement::Below, rows }
+    }
+
+    #[test]
+    fn blocks_reserve_continuation_rows_below_their_line() {
+        let document = Document::new("a\nb\nc");
+        let mut map = DisplayMap::new(&document.snapshot(), DisplayConfig::unwrapped());
+        map.set_blocks([block(7, 1, 3)]);
+        assert_eq!(map.row_count(), 6);
+        let rows = map.rows_in(0..6);
+        assert_eq!(rows[1].buffer_line, 1);
+        assert!(rows[1].block.is_none());
+        for (index, row) in rows[2..5].iter().enumerate() {
+            assert_eq!(row.buffer_line, 1);
+            assert!(row.continuation && !row.folded);
+            assert_eq!(row.start_byte, row.end_byte);
+            assert_eq!(
+                row.block,
+                Some(BlockRow { id: 7, index: index as u32, rows: 3 })
+            );
+            assert_eq!(map.row(2 + index).as_ref(), Some(row));
+        }
+        assert_eq!(rows[5].buffer_line, 2);
+        assert_eq!(map.line_to_row(2), Some(5));
+        assert_eq!(map.block_to_row(7), Some(2));
+        // Text positions are unaffected by the reservation.
+        assert_eq!(
+            map.buffer_to_display(4, Affinity::After).unwrap(),
+            DisplayPoint { row: 5, column: 0 }
+        );
+    }
+
+    #[test]
+    fn clearing_blocks_restores_the_original_layout() {
+        let document = Document::new("a\nb\nc");
+        let mut map = DisplayMap::new(&document.snapshot(), DisplayConfig::unwrapped());
+        map.set_blocks([block(1, 0, 2), block(2, 0, 1), block(3, 2, 4)]);
+        assert_eq!(map.row_count(), 10);
+        assert_eq!(map.block_to_row(2), Some(3));
+        map.set_blocks([]);
+        assert_eq!(map.row_count(), 3);
+        assert!(map.rows_in(0..3).iter().all(|row| row.block.is_none()));
+    }
+
+    #[test]
+    fn blocks_follow_their_line_through_edits() {
+        let document = Document::new("a\nb\nc");
+        let mut map = DisplayMap::new(&document.snapshot(), DisplayConfig::unwrapped());
+        map.set_blocks([block(1, 2, 2)]);
+        let mut document = document;
+        let applied = document
+            .apply(&Transaction::new().insert(0, "new\n"))
+            .expect("insert applies");
+        map.update(&document.snapshot(), &applied).expect("update");
+        assert_eq!(map.blocks()[0].line, 3);
+        assert_eq!(map.row_count(), 6);
+        assert_eq!(map.block_to_row(1), Some(4));
+    }
+
+    #[test]
+    fn a_fold_hides_blocks_on_its_inner_lines() {
+        let document = Document::new("a\nb\nc\nd");
+        let mut map = DisplayMap::new(&document.snapshot(), DisplayConfig::unwrapped());
+        map.set_blocks([block(1, 1, 2)]);
+        map.set_folds(FoldSet::new([FoldRegion::new(0, 3)]));
+        assert_eq!(map.block_to_row(1), None);
+        assert_eq!(map.row_count(), 2);
+    }
+
+    #[test]
+    fn blocks_above_a_line_precede_its_text_and_number() {
+        let document = Document::new("a\nb");
+        let mut map = DisplayMap::new(&document.snapshot(), DisplayConfig::unwrapped());
+        map.set_blocks([Block { id: 4, line: 0, placement: BlockPlacement::Above, rows: 2 }]);
+        assert_eq!(map.row_count(), 4);
+        let rows = map.rows_in(0..4);
+        assert_eq!(rows[0].block.map(|b| (b.id, b.index)), Some((4, 0)));
+        assert_eq!(rows[1].block.map(|b| (b.id, b.index)), Some((4, 1)));
+        assert!(rows[2].block.is_none() && !rows[2].continuation);
+        assert_eq!((rows[2].buffer_line, rows[2].start_byte), (0, 0));
+        assert_eq!(map.line_to_row(0), Some(2));
+        assert_eq!(map.block_to_row(4), Some(0));
+        assert_eq!(map.row(0).unwrap().start_byte, 0);
+        assert_eq!(
+            map.buffer_to_display(0, Affinity::After).unwrap(),
+            DisplayPoint { row: 2, column: 0 }
+        );
+        // Above and below blocks on one line keep their own sides.
+        map.set_blocks([
+            Block { id: 4, line: 0, placement: BlockPlacement::Above, rows: 2 },
+            Block { id: 5, line: 0, placement: BlockPlacement::Below, rows: 1 },
+        ]);
+        assert_eq!(map.block_to_row(5), Some(3));
+        assert_eq!(map.row_count(), 5);
+        assert_eq!(map.rows_in(0..5).iter().filter(|r| r.block.is_some()).count(), 3);
     }
 }

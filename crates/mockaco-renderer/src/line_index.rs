@@ -80,7 +80,6 @@ impl LineIndex {
             .saturating_sub(1)
     }
 
-    #[cfg(test)]
     pub(crate) fn get(&self, line: usize) -> Option<LineInfo> {
         if line >= self.lines {
             return None;

@@ -549,6 +549,7 @@ mod row_text_tests {
             truncated: false,
             active: false,
             indent_guides: Vec::new(),
+            block: None,
             tokens,
         }
     }

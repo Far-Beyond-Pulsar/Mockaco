@@ -794,7 +794,7 @@ impl WgpuiEditorView {
 
     /// Window-space left edge, line top and line bottom for `byte`, or
     /// `None` when it is scrolled out of view.
-    fn overlay_position(&self, byte: usize) -> Option<(f32, f32, f32)> {
+    pub(super) fn overlay_position(&self, byte: usize) -> Option<(f32, f32, f32)> {
         let (text_x, text_y) = self.surface.byte_to_text_pixel(byte)?;
         let (rem_x, rem_y) = self.remainders();
         let top = self.intel.origin.y.to_f32() + text_y - rem_y;
