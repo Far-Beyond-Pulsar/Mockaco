@@ -21,7 +21,7 @@ use mockaco_renderer::{
     diagnostic_decorations, search_decorations, Decoration, DisplayMap, DisplayMapError,
     DIAGNOSTIC_ERROR_STYLE_ID, DIAGNOSTIC_HINT_STYLE_ID, DIAGNOSTIC_INFO_STYLE_ID,
     DIAGNOSTIC_WARNING_STYLE_ID, SEARCH_CURRENT_MATCH_STYLE_ID, SEARCH_MATCH_STYLE_ID,
-    DisplayPoint, DisplayViewport, GutterLayout, ProjectedDecoration,
+    Block, BlockRow, DisplayPoint, DisplayViewport, GutterLayout, ProjectedDecoration,
 };
 use std::fmt;
 use std::ops::Range;
@@ -375,6 +375,8 @@ pub struct PaintRow {
     pub truncated: bool,
     pub active: bool,
     pub indent_guides: Vec<usize>,
+    /// Set for rows that are reserved space for a host block, not text.
+    pub block: Option<BlockRow>,
     pub tokens: Vec<PaintToken>,
 }
 
@@ -840,6 +842,34 @@ impl EditorSurface {
         self.display.set_foldable_regions(folds);
         self.recompute_scroll_viewport();
         self.invalidation.push(InvalidationKind::Geometry, None);
+    }
+
+    /// Reserves display rows below buffer lines for host-painted content
+    /// (inline chat boxes, diff hunks, peek views). See [`Block`]. The rows
+    /// carry no text, number or caret; find them in [`PaintRow::block`] and
+    /// with [`Self::block_rect`].
+    pub fn set_blocks(&mut self, blocks: impl IntoIterator<Item = Block>) {
+        self.display.set_blocks(blocks);
+        self.recompute_scroll_viewport();
+        self.invalidation.push(InvalidationKind::Geometry, None);
+    }
+
+    pub fn blocks(&self) -> &[Block] {
+        self.display.blocks()
+    }
+
+    /// Where block `id` is, relative to the first visible row (the same
+    /// frame as [`Self::byte_to_text_pixel`]): `(top, height)` in pixels.
+    /// `None` when the block does not exist or a fold hides it. The top may be
+    /// negative or past the viewport when the block is scrolled out of view.
+    pub fn block_rect(&self, id: u64) -> Option<(f32, f32)> {
+        let row = self.display.block_to_row(id)?;
+        let rows = self.display.blocks().iter().find(|block| block.id == id)?.rows;
+        let line_height = self.geometry.line_height;
+        Some((
+            (row as f32 - self.scroll.top_row as f32) * line_height,
+            rows as f32 * line_height,
+        ))
     }
 
     pub fn toggle_fold_at_line(&mut self, line: usize) -> bool {
@@ -1431,27 +1461,36 @@ impl EditorSurface {
                     continuation: row.continuation,
                     folded: row.folded,
                     truncated: row.truncated,
-                    active: active_buffer_line == Some(row.buffer_line),
-                    indent_guides: indent_guides_for_line(
-                        text,
-                        position_map
-                            .line_start(row.buffer_line)
-                            .unwrap_or(row.start_byte),
-                        position_map
-                            .line_end(row.buffer_line)
-                            .unwrap_or(row.end_byte),
-                        self.display.config().tab_width,
-                    ),
-                    tokens: self
-                        .highlights
-                        .tokens_in_range(row.start_byte..row.end_byte)
-                        .iter()
-                        .map(|token| PaintToken {
-                            range: token.range.clone(),
-                            kind: token.kind.clone(),
-                            style: self.theme.syntax.style_for(&token.kind),
-                        })
-                        .collect(),
+                    active: row.block.is_none()
+                        && active_buffer_line == Some(row.buffer_line),
+                    indent_guides: if row.block.is_some() {
+                        Vec::new()
+                    } else {
+                        indent_guides_for_line(
+                            text,
+                            position_map
+                                .line_start(row.buffer_line)
+                                .unwrap_or(row.start_byte),
+                            position_map
+                                .line_end(row.buffer_line)
+                                .unwrap_or(row.end_byte),
+                            self.display.config().tab_width,
+                        )
+                    },
+                    block: row.block,
+                    tokens: if row.block.is_some() {
+                        Vec::new()
+                    } else {
+                        self.highlights
+                            .tokens_in_range(row.start_byte..row.end_byte)
+                            .iter()
+                            .map(|token| PaintToken {
+                                range: token.range.clone(),
+                                kind: token.kind.clone(),
+                                style: self.theme.syntax.style_for(&token.kind),
+                            })
+                            .collect()
+                    },
                 }
             })
             .collect::<Vec<_>>();
@@ -2139,6 +2178,7 @@ impl InputRouter {
         } else {
             return InputOutcome::handled();
         };
+        let row = skip_block_rows(&surface.display, row, below);
         let Some(target_row) = surface.display.row(row) else {
             return InputOutcome::handled();
         };
@@ -2740,6 +2780,7 @@ impl InputRouter {
                 point.row.saturating_add(delta as usize)
             }
             .min(surface.display.row_count().saturating_sub(1));
+            let row = skip_block_rows(&surface.display, row, !delta.is_negative());
             let target_column = (*desired).min(
                 surface
                     .display
@@ -2989,6 +3030,32 @@ impl InputRouter {
 /// desktop editor. `x` is relative to the editor's left edge (gutter
 /// included) plus any sub-column scroll remainder; `y` is relative to the top
 /// of the first rendered row.
+/// `row`, or the nearest text row in the direction of travel when it is
+/// reserved block space (carets never rest there). Falls back to the other
+/// direction at the document's edge.
+fn skip_block_rows(display: &DisplayMap, row: usize, forward: bool) -> usize {
+    let is_block = |row: usize| display.row(row).is_some_and(|row| row.block.is_some());
+    if !is_block(row) {
+        return row;
+    }
+    let last = display.row_count().saturating_sub(1);
+    let walk = |forward: bool| {
+        let mut row = row;
+        while is_block(row) {
+            if forward {
+                if row >= last {
+                    return None;
+                }
+                row += 1;
+            } else {
+                row = row.checked_sub(1)?;
+            }
+        }
+        Some(row)
+    };
+    walk(forward).or_else(|| walk(!forward)).unwrap_or(row)
+}
+
 fn mouse_to_byte(surface: &EditorSurface, x: f32, y: f32) -> Result<usize, SurfaceError> {
     if !x.is_finite() || !y.is_finite() || surface.geometry.line_height <= 0.0 {
         return Err(SurfaceError::Input(InputError::InvalidMouseCoordinate));
@@ -3784,5 +3851,25 @@ mod tests {
         // Round-trips with the pixel position of a byte.
         let (x, y) = surface.byte_to_text_pixel(3).unwrap();
         assert_eq!((x, y), (24.0, 0.0));
+    }
+
+    #[test]
+    fn blocks_reserve_rows_and_carets_step_over_them() {
+        let mut surface = surface("one\ntwo\nthree");
+        surface.set_blocks([Block { id: 9, after_line: 0, rows: 2 }]);
+        let (top, height) = surface.block_rect(9).expect("block is laid out");
+        assert_eq!(top, surface.geometry().line_height);
+        assert_eq!(height, 2.0 * surface.geometry().line_height);
+        let frame = surface.render_frame();
+        let reserved: Vec<_> = frame.rows.iter().filter(|row| row.block.is_some()).collect();
+        assert_eq!(reserved.len(), 2);
+        assert!(reserved.iter().all(|row| row.text.is_empty() && !row.active));
+        // Row 1 and 2 are the block; stepping down from line 0 skips them.
+        assert_eq!(skip_block_rows(surface.display(), 1, true), 3);
+        assert_eq!(skip_block_rows(surface.display(), 2, false), 0);
+        assert_eq!(skip_block_rows(surface.display(), 0, true), 0);
+        surface.set_blocks([]);
+        assert!(surface.block_rect(9).is_none());
+        assert_eq!(surface.display().row_count(), 3);
     }
 }

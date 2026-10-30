@@ -34,7 +34,7 @@ use std::rc::Rc;
 use std::time::Instant;
 use wgpui::{
     div, fill, font, point, px, size,
-    App, Bounds, ClipboardItem, ContentMask, Context, Corners,
+    AnyElement, AnyView, App, Bounds, ClipboardItem, ContentMask, Context, Corners,
     CursorStyle, DispatchPhase, Element, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
     Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, GlobalElementId, Hitbox,
     HitboxBehavior, Hsla, InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent,
@@ -152,6 +152,8 @@ pub struct WgpuiEditorView {
     hover: Region,
     show_minimap: bool,
     line_backgrounds: HashMap<usize, SurfaceColor>,
+    /// Host views shown in reserved block rows, by block id.
+    block_views: HashMap<u64, AnyView>,
     /// Show fold chevrons on every foldable line (true) or only while the
     /// pointer is over the gutter (false).
     always_show_fold_controls: bool,
@@ -199,6 +201,7 @@ impl WgpuiEditorView {
             hover: Region::None,
             show_minimap: true,
             line_backgrounds: HashMap::new(),
+            block_views: HashMap::new(),
             always_show_fold_controls: true,
             minimap_buffer: None,
             intel: Intel::default(),
@@ -262,6 +265,100 @@ impl WgpuiEditorView {
     ) {
         self.line_backgrounds = backgrounds;
         cx.notify();
+    }
+
+    // ---- inline blocks -----------------------------------------------
+
+    /// Shows `view` in `rows` display rows reserved below buffer line
+    /// `after_line`, replacing any block with the same `id`. The view is
+    /// clipped to the code area and stays attached to its line through edits.
+    /// Call again with a new `rows` to resize it (a streaming answer growing).
+    pub fn set_block(
+        &mut self,
+        id: u64,
+        after_line: usize,
+        rows: u32,
+        view: AnyView,
+        cx: &mut Context<Self>,
+    ) {
+        let mut blocks: Vec<mockaco_renderer::Block> = self
+            .surface
+            .blocks()
+            .iter()
+            .copied()
+            .filter(|block| block.id != id)
+            .collect();
+        blocks.push(mockaco_renderer::Block { id, after_line, rows });
+        self.surface.set_blocks(blocks);
+        self.block_views.insert(id, view);
+        cx.notify();
+    }
+
+    /// Removes block `id` and gives its rows back.
+    pub fn remove_block(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.block_views.remove(&id).is_none() {
+            return;
+        }
+        let blocks: Vec<mockaco_renderer::Block> = self
+            .surface
+            .blocks()
+            .iter()
+            .copied()
+            .filter(|block| block.id != id)
+            .collect();
+        self.surface.set_blocks(blocks);
+        cx.notify();
+    }
+
+    pub fn clear_blocks(&mut self, cx: &mut Context<Self>) {
+        self.block_views.clear();
+        self.surface.set_blocks([]);
+        cx.notify();
+    }
+
+    /// The buffer line block `id` currently hangs below (it moves with edits).
+    pub fn block_line(&self, id: u64) -> Option<usize> {
+        self.surface
+            .blocks()
+            .iter()
+            .find(|block| block.id == id)
+            .map(|block| block.after_line)
+    }
+
+    /// The block views that intersect the viewport, placed over their
+    /// reserved rows.
+    fn render_blocks(&self) -> Option<AnyElement> {
+        if self.block_views.is_empty() {
+            return None;
+        }
+        let (_, rem_y) = self.remainders();
+        let width = (self.layout.code_right - self.layout.text_left).max(0.0);
+        let viewport = self.layout.viewport_height;
+        let children = self.block_views.iter().filter_map(|(id, view)| {
+            let (top, height) = self.surface.block_rect(*id)?;
+            let top = top - rem_y;
+            (top + height > 0.0 && top < viewport).then(|| {
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(top))
+                    .w(px(width))
+                    .h(px(height))
+                    .overflow_hidden()
+                    .child(view.clone())
+            })
+        });
+        Some(
+            div()
+                .absolute()
+                .left(px(self.layout.text_left))
+                .top(px(0.0))
+                .w(px(width))
+                .h(px(viewport))
+                .overflow_hidden()
+                .children(children)
+                .into_any_element(),
+        )
     }
 
     /// Replaces the whole document (file loads, external changes).
@@ -881,7 +978,12 @@ impl WgpuiEditorView {
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A view hosted in a block (an inline prompt) has its own focus; its
+        // keystrokes bubble through here and must not edit the document.
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
         let keystroke = &event.keystroke;
         let modifiers = KeyModifiers {
             shift: keystroke.modifiers.shift,
@@ -1163,6 +1265,20 @@ impl WgpuiEditorView {
                 }
                 let (rem_x, rem_y) = self.remainders();
                 let (px_x, px_y) = (x + rem_x, y + rem_y);
+                // Reserved block rows belong to the host's own UI.
+                let row = self
+                    .surface
+                    .scroll()
+                    .top_row
+                    .saturating_add((px_y / self.line_height).floor() as usize);
+                if self
+                    .surface
+                    .display()
+                    .row(row)
+                    .is_some_and(|row| row.block.is_some())
+                {
+                    return;
+                }
                 let event = if shift && region == Region::Text {
                     MouseEvent::Extend { x: px_x, y: px_y }
                 } else {
@@ -1331,6 +1447,9 @@ impl WgpuiEditorView {
         for region in self.surface.display().folds().regions() {
             (region.start_line, region.end_line).hash(&mut folds);
         }
+        for block in self.surface.display().blocks() {
+            (block.id, block.after_line, block.rows).hash(&mut folds);
+        }
         (
             self.surface.document().version(),
             folds.finish(),
@@ -1442,6 +1561,7 @@ impl Render for WgpuiEditorView {
             .child(EditorElement {
                 editor: cx.entity(),
             })
+            .children(self.render_blocks())
             .children(overlays)
     }
 }
