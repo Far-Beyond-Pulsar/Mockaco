@@ -21,6 +21,7 @@ use crate::{
 };
 mod lsp;
 mod review;
+pub use review::REVIEW_BLOCK_BASE;
 use self::lsp::{EditKind, Intel};
 use mockaco_core::{
     Affinity, CaseSensitivity, Edit, Grouping, SearchQuery, SearchSession, Selection, SelectionSet,
