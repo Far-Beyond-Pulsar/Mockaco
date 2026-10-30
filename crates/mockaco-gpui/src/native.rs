@@ -1288,8 +1288,26 @@ impl WgpuiEditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle, cx);
         let region = self.region_at(x, y);
+        // Reserved block rows belong to the host's own UI: a click there must
+        // neither move the caret nor take focus from the view in the block.
+        if matches!(region, Region::Gutter | Region::Text) && y < self.layout.viewport_height {
+            let (_, rem_y) = self.remainders();
+            let row = self
+                .surface
+                .scroll()
+                .top_row
+                .saturating_add(((y + rem_y) / self.line_height).floor() as usize);
+            if self
+                .surface
+                .display()
+                .row(row)
+                .is_some_and(|row| row.block.is_some())
+            {
+                return;
+            }
+        }
+        window.focus(&self.focus_handle, cx);
         self.dismiss_hover(cx);
         self.close_completion(cx);
         match region {
@@ -1341,20 +1359,6 @@ impl WgpuiEditorView {
                 }
                 let (rem_x, rem_y) = self.remainders();
                 let (px_x, px_y) = (x + rem_x, y + rem_y);
-                // Reserved block rows belong to the host's own UI.
-                let row = self
-                    .surface
-                    .scroll()
-                    .top_row
-                    .saturating_add((px_y / self.line_height).floor() as usize);
-                if self
-                    .surface
-                    .display()
-                    .row(row)
-                    .is_some_and(|row| row.block.is_some())
-                {
-                    return;
-                }
                 let event = if shift && region == Region::Text {
                     MouseEvent::Extend { x: px_x, y: px_y }
                 } else {
