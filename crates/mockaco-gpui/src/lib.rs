@@ -17,11 +17,12 @@ use mockaco_language::{
     IncrementalHighlights, LanguageSyntax, Rgba, RustTreeSitterProvider,
     Theme, TokenKind, TokenStyle,
 };
+pub use mockaco_renderer::BlockPlacement;
 use mockaco_renderer::{
     diagnostic_decorations, search_decorations, Decoration, DisplayMap, DisplayMapError,
     DIAGNOSTIC_ERROR_STYLE_ID, DIAGNOSTIC_HINT_STYLE_ID, DIAGNOSTIC_INFO_STYLE_ID,
     DIAGNOSTIC_WARNING_STYLE_ID, SEARCH_CURRENT_MATCH_STYLE_ID, SEARCH_MATCH_STYLE_ID,
-    Block, BlockPlacement, BlockRow, DisplayPoint, DisplayViewport, GutterLayout, ProjectedDecoration,
+    Block, BlockRow, DisplayPoint, DisplayViewport, GutterLayout, ProjectedDecoration,
 };
 use std::fmt;
 use std::ops::Range;

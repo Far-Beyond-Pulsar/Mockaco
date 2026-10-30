@@ -676,7 +676,7 @@ impl DisplayMap {
         let new_first_line = new_text.byte_to_line(new_range.start)?;
         let new_last_line = new_text.byte_to_line(new_range.end)?;
 
-        self.remap_blocks(old_first_line..=old_last_line, new_first_line..=new_last_line);
+        self.remap_blocks(snapshot, &transaction.change_map);
         let infos = (new_first_line..=new_last_line)
             .map(|line| {
                 new_text.line(line).map(|text| {
@@ -1022,25 +1022,26 @@ impl DisplayMap {
         self.last_update = None;
     }
 
-    /// Keeps blocks attached to their lines across an edit that replaced
-    /// `old` lines with `new` lines. Blocks after the edit shift with their
-    /// line; blocks inside it keep their offset, clamped to the new range.
-    fn remap_blocks(
-        &mut self,
-        old: std::ops::RangeInclusive<usize>,
-        new: std::ops::RangeInclusive<usize>,
-    ) {
+    /// Keeps blocks attached to their text across an edit: each block's line
+    /// start is carried through the edit's change map, so a block follows its
+    /// line when lines are inserted above it or the lines around it are
+    /// replaced by a different number of lines.
+    fn remap_blocks(&mut self, new_snapshot: &DocumentSnapshot, changes: &mockaco_core::ChangeMap) {
         if self.blocks.is_empty() {
             return;
         }
-        let delta = *new.end() as i64 - *old.end() as i64;
+        let old_map = self.snapshot.position_map();
+        let new_map = new_snapshot.position_map();
+        let last = new_map.line_count().saturating_sub(1);
         for block in &mut self.blocks {
-            if block.line > *old.end() {
-                block.line = (block.line as i64 + delta).max(0) as usize;
-            } else if block.line >= *old.start() {
-                block.line =
-                    (*new.start() + (block.line - *old.start())).min(*new.end());
-            }
+            let Ok(start) = old_map.line_start(block.line) else {
+                block.line = block.line.min(last);
+                continue;
+            };
+            let mapped = changes.map_offset(start, Affinity::After);
+            block.line = new_map
+                .byte_to_line(mapped)
+                .map_or(last, |line| line.min(last));
         }
         self.blocks.sort_by_key(|block| (block.line, block.id));
     }

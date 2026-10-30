@@ -20,6 +20,7 @@ use crate::{
     CODE_PADDING, GUTTER_FOLD_WIDTH, GUTTER_MARKER_WIDTH,
 };
 mod lsp;
+mod review;
 use self::lsp::{EditKind, Intel};
 use mockaco_core::{
     Affinity, CaseSensitivity, Edit, Grouping, SearchQuery, SearchSession, Selection, SelectionSet,
@@ -76,6 +77,10 @@ pub enum EditorEvent {
     /// The selected completion has no documentation yet: answer with
     /// [`WgpuiEditorView::resolve_completion`].
     CompletionResolveRequested { request: u64, host_data: u64 },
+    /// An inline review has hunks left; `pending` is how many.
+    ReviewUpdated { pending: usize },
+    /// The review is closed: every hunk was accepted or rejected.
+    ReviewFinished { accepted: usize, rejected: usize },
     /// A completion tagged with `host_data` was accepted. Hosts that resolve
     /// lazily fetch its extra edits and answer with
     /// [`WgpuiEditorView::apply_position_edits`].
@@ -154,6 +159,9 @@ pub struct WgpuiEditorView {
     line_backgrounds: HashMap<usize, SurfaceColor>,
     /// Host views shown in reserved block rows, by block id.
     block_views: HashMap<u64, AnyView>,
+    review: Option<review::ReviewState>,
+    /// Added-line tints of an open review, drawn under host line backgrounds.
+    review_backgrounds: HashMap<usize, SurfaceColor>,
     /// Show fold chevrons on every foldable line (true) or only while the
     /// pointer is over the gutter (false).
     always_show_fold_controls: bool,
@@ -202,6 +210,8 @@ impl WgpuiEditorView {
             show_minimap: true,
             line_backgrounds: HashMap::new(),
             block_views: HashMap::new(),
+            review: None,
+            review_backgrounds: HashMap::new(),
             always_show_fold_controls: true,
             minimap_buffer: None,
             intel: Intel::default(),
@@ -993,6 +1003,10 @@ impl WgpuiEditorView {
             command: keystroke.modifiers.platform,
         };
         let primary = modifiers.control || modifiers.command;
+        if self.review_key(keystroke.key.as_str(), primary, modifiers.alt, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if self.intel.enabled {
             let name = keystroke.key.as_str();
             let is_modifier = matches!(
@@ -1494,7 +1508,15 @@ impl WgpuiEditorView {
         let backgrounds = frame
             .rows
             .iter()
-            .map(|row| self.line_backgrounds.get(&row.buffer_line).copied())
+            .map(|row| {
+                if row.block.is_some() {
+                    return None;
+                }
+                self.line_backgrounds
+                    .get(&row.buffer_line)
+                    .or_else(|| self.review_backgrounds.get(&row.buffer_line))
+                    .copied()
+            })
             .collect();
         PaintData {
             layout: self.layout,

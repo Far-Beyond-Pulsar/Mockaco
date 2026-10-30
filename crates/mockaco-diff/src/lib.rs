@@ -5,6 +5,8 @@
 //! the modified [`EditorState`]. The model exposes aligned rows, hunk ranges,
 //! position conversion, decorations, and scroll policy for presentation crates.
 
+pub mod review;
+
 use mockaco_core::{DocumentSnapshot, Edit, EditorState, Grouping, Transaction, TransactionError};
 use similar::{DiffTag, TextDiff};
 use std::fmt;
