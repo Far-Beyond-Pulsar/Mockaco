@@ -36,7 +36,7 @@ use std::rc::Rc;
 use std::time::Instant;
 use wgpui::{
     div, fill, font, point, px, size,
-    AnyElement, AnyView, App, Bounds, ClipboardItem, ContentMask, Context, Corners,
+    canvas, AnyElement, AnyView, App, Bounds, ClipboardItem, ContentMask, Context, Corners,
     CursorStyle, DispatchPhase, Element, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
     Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, GlobalElementId, Hitbox,
     HitboxBehavior, Hsla, InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent,
@@ -54,6 +54,44 @@ const MINIMAP_PADDING: f32 = 8.0;
 const MINIMAP_MIN_EDITOR_WIDTH: f32 = 480.0;
 /// Lines scrolled per mouse-wheel notch.
 const WHEEL_LINES: f32 = 3.0;
+/// Tells scrolling that stays inside a block's own scroller from scrolling
+/// that should carry on into the editor.
+///
+/// A scroller consumes a wheel event only while it can still move, so an event
+/// that reaches the block's bubble phase found the inner content at its limit.
+/// The editor takes it only when the previous event was *not* consumed or
+/// came a while ago: one gesture never both exhausts the inner scroller and
+/// scrolls the editor, and a new gesture at the limit chains on.
+#[derive(Default)]
+struct ScrollLatch {
+    /// A capture-phase event is awaiting its bubble phase.
+    pending: bool,
+    last_event: Option<Instant>,
+    /// When the inner content last used up an event.
+    consumed_at: Option<Instant>,
+}
+
+impl ScrollLatch {
+    /// Events closer together than this belong to one gesture.
+    const GESTURE_GAP: std::time::Duration = std::time::Duration::from_millis(250);
+
+    fn capture(&mut self, now: Instant) {
+        if self.pending {
+            // The previous event never bubbled: the inner scroller took it.
+            self.consumed_at = self.last_event;
+        }
+        self.pending = true;
+        self.last_event = Some(now);
+    }
+
+    /// Whether an event that reached the bubble phase must be swallowed.
+    fn swallow(&mut self, now: Instant) -> bool {
+        self.pending = false;
+        self.consumed_at
+            .is_some_and(|at| now.duration_since(at) < Self::GESTURE_GAP)
+    }
+}
+
 /// Extra columns of horizontal range matching the surface's scroll slack.
 const COLUMN_SLACK: usize = 6;
 
@@ -168,6 +206,7 @@ pub struct WgpuiEditorView {
     line_backgrounds: HashMap<usize, SurfaceColor>,
     /// Host views shown in reserved block rows, by block id.
     block_views: HashMap<u64, AnyView>,
+    block_latches: std::cell::RefCell<HashMap<u64, Rc<std::cell::RefCell<ScrollLatch>>>>,
     review: Option<review::ReviewState>,
     last_selection: Option<(usize, usize)>,
     /// Added-line tints of an open review, drawn under host line backgrounds.
@@ -220,6 +259,7 @@ impl WgpuiEditorView {
             show_minimap: true,
             line_backgrounds: HashMap::new(),
             block_views: HashMap::new(),
+            block_latches: Default::default(),
             review: None,
             last_selection: None,
             review_backgrounds: HashMap::new(),
@@ -397,6 +437,8 @@ impl WgpuiEditorView {
             let (top, height) = self.surface.block_rect(*id)?;
             let top = top - rem_y;
             (top + height > 0.0 && top < viewport).then(|| {
+                let latch = self.block_latches.borrow_mut().entry(*id).or_default().clone();
+                let observer = latch.clone();
                 div()
                     .absolute()
                     .left(px(0.0))
@@ -404,7 +446,33 @@ impl WgpuiEditorView {
                     .w(px(width))
                     .h(px(height))
                     .overflow_hidden()
+                    // Notes every wheel event over the block, consumed or not.
+                    .child(
+                        canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                window.on_mouse_event(
+                                    move |event: &ScrollWheelEvent, phase, _, _| {
+                                        if phase == DispatchPhase::Capture
+                                            && bounds.contains(&event.position)
+                                        {
+                                            observer.borrow_mut().capture(Instant::now());
+                                        }
+                                    },
+                                );
+                            },
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
                     .child(view.clone())
+                    // Reached only when the block's own content could not
+                    // scroll any further.
+                    .on_scroll_wheel(move |_, _, cx| {
+                        if latch.borrow_mut().swallow(Instant::now()) {
+                            cx.stop_propagation();
+                        }
+                    })
             })
         });
         Some(
@@ -2289,5 +2357,39 @@ fn paint_scrollbars(data: &PaintData, origin: Point<Pixels>, window: &mut Window
             )
             .corner_radii(Corners::all(px(THUMB_THICKNESS / 2.0))),
         );
+    }
+}
+
+#[cfg(test)]
+mod scroll_latch_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_gesture_that_exhausts_the_inner_scroller_never_leaks_into_the_editor() {
+        let mut latch = ScrollLatch::default();
+        let t = Instant::now();
+        // Event 1 is consumed by the inner scroller (never bubbles); event 2,
+        // 16ms later, finds it at its limit and bubbles: swallowed.
+        latch.capture(t);
+        latch.capture(t + Duration::from_millis(16));
+        assert!(latch.swallow(t + Duration::from_millis(16)));
+        // Still the same gesture.
+        latch.capture(t + Duration::from_millis(32));
+        assert!(latch.swallow(t + Duration::from_millis(32)));
+        // A fresh input long after chains on to the editor.
+        latch.capture(t + Duration::from_millis(900));
+        assert!(!latch.swallow(t + Duration::from_millis(900)));
+    }
+
+    #[test]
+    fn content_that_cannot_scroll_passes_every_event_through() {
+        let mut latch = ScrollLatch::default();
+        let t = Instant::now();
+        for step in 0..5 {
+            let now = t + Duration::from_millis(step * 16);
+            latch.capture(now);
+            assert!(!latch.swallow(now));
+        }
     }
 }
