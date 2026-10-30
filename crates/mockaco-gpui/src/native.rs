@@ -77,6 +77,14 @@ pub enum EditorEvent {
     /// The selected completion has no documentation yet: answer with
     /// [`WgpuiEditorView::resolve_completion`].
     CompletionResolveRequested { request: u64, host_data: u64 },
+    /// The primary selection (or caret) moved or the text under it changed.
+    /// Not sent while a mouse drag is in progress; the drag's end sends it.
+    SelectionChanged,
+    /// Ctrl/Cmd+I: the user wants to talk to an assistant about the
+    /// selection or caret.
+    InlineAssistRequested,
+    /// Ctrl/Cmd+.: the user wants fixes and refactorings for the caret.
+    QuickFixRequested,
     /// An inline review has hunks left; `pending` is how many.
     ReviewUpdated { pending: usize },
     /// The review is closed: every hunk was accepted or rejected.
@@ -160,6 +168,7 @@ pub struct WgpuiEditorView {
     /// Host views shown in reserved block rows, by block id.
     block_views: HashMap<u64, AnyView>,
     review: Option<review::ReviewState>,
+    last_selection: Option<(usize, usize)>,
     /// Added-line tints of an open review, drawn under host line backgrounds.
     review_backgrounds: HashMap<usize, SurfaceColor>,
     /// Show fold chevrons on every foldable line (true) or only while the
@@ -211,6 +220,7 @@ impl WgpuiEditorView {
             line_backgrounds: HashMap::new(),
             block_views: HashMap::new(),
             review: None,
+            last_selection: None,
             review_backgrounds: HashMap::new(),
             always_show_fold_controls: true,
             minimap_buffer: None,
@@ -275,6 +285,43 @@ impl WgpuiEditorView {
     ) {
         self.line_backgrounds = backgrounds;
         cx.notify();
+    }
+
+    // ---- selection ------------------------------------------------------
+
+    /// The primary selection as a byte range (empty for a caret).
+    pub fn selection_range(&self) -> std::ops::Range<usize> {
+        self.surface
+            .editor()
+            .selections()
+            .primary()
+            .map_or(0..0, |selection| selection.ordered_range())
+    }
+
+    /// The text of the primary selection (empty for a caret).
+    pub fn selected_text(&self) -> String {
+        let range = self.selection_range();
+        self.surface
+            .document()
+            .text()
+            .slice(range)
+            .into_owned()
+    }
+
+    /// Window-space `(left, line top, line bottom)` of `byte`, or `None` when
+    /// it is scrolled out of view or the view has not been painted. For
+    /// anchoring a host's popups to the text.
+    pub fn byte_window_rect(&self, byte: usize) -> Option<(f32, f32, f32)> {
+        self.overlay_position(byte)
+    }
+
+    fn emit_selection_changed(&mut self, cx: &mut Context<Self>) {
+        let range = self.selection_range();
+        let key = (range.start, range.end);
+        if self.last_selection != Some(key) {
+            self.last_selection = Some(key);
+            cx.emit(EditorEvent::SelectionChanged);
+        }
     }
 
     // ---- inline blocks -----------------------------------------------
@@ -957,6 +1004,9 @@ impl WgpuiEditorView {
                 if outcome.document_changed {
                     self.after_edit(edit_kind, cx);
                 }
+                if (outcome.selection_changed || outcome.document_changed) && self.drag != Drag::Text {
+                    self.emit_selection_changed(cx);
+                }
                 // Only keyboard navigation retargets scrolling; a mouse click
                 // never shifts the view (the paint-time sync restores it).
                 if outcome.scroll_changed && !is_scroll && keyboard {
@@ -1040,6 +1090,16 @@ impl WgpuiEditorView {
         }
         if primary && !modifiers.alt {
             match keystroke.key.as_str() {
+                "i" => {
+                    cx.emit(EditorEvent::InlineAssistRequested);
+                    cx.stop_propagation();
+                    return;
+                }
+                "." => {
+                    cx.emit(EditorEvent::QuickFixRequested);
+                    cx.stop_propagation();
+                    return;
+                }
                 "s" => {
                     cx.emit(EditorEvent::SaveRequested);
                     cx.stop_propagation();
@@ -1420,6 +1480,7 @@ impl WgpuiEditorView {
                 }),
                 cx,
             );
+            self.emit_selection_changed(cx);
         }
         if was != Drag::None {
             cx.notify();
